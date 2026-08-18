@@ -31,7 +31,11 @@ MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_TEXT_CHARS = 50_000
 
 INSTRUCTIONS = (
-    "OMOS shared-drive knowledge base. Every project folder follows this structure:\n"
+    "OMOS shared-drive knowledge base — the single source of truth for ALL internal project "
+    "documents. USE THESE TOOLS (without being asked) whenever the user asks about any project, "
+    "BRD, requirement, timeline, แผนงาน, กำหนดการ, system flow, database/DB schema, API spec, "
+    "project overview, รายละเอียดโปรเจค, เอกสารโปรเจค, or mentions a project by name.\n"
+    "Every project folder follows this structure:\n"
     "  <Project Name>/ -> Project Overview | Timeline | Design (System Flow, DB, API) | BRD\n\n"
     "How to answer questions:\n"
     "1. ALWAYS call omos_index first, then filter by Project Name.\n"
@@ -149,8 +153,9 @@ def _cite(file_id: str, name: str, link: str) -> str:
 @mcp.tool()
 def omos_index() -> str:
     """Get the full index of the OMOS drive: every project and its files (with file ids and links).
-    ALWAYS call this first, then filter by Project Name before drilling into
-    Timeline / BRD / Design (System Flow, DB, API)."""
+    Use this whenever the user asks about any internal project, BRD, timeline, design,
+    system flow, DB, API, or เอกสารโปรเจค — ALWAYS call this first, then filter by
+    Project Name before drilling into Timeline / BRD / Design (System Flow, DB, API)."""
     _ensure_index()
     n = len(_cache["projects"])
     return _cache["markdown"] + f"\n\n_{n} project(s). Cite files with the links above._"
