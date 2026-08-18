@@ -1,0 +1,23 @@
+[project]
+name = "omos-mcp"
+version = "0.1.0"
+description = "MCP server for reading OMOS project documents on Google Drive"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0.0,<2",  # ponytail: pinned to 1.x — server uses the 1.x FastMCP/auth API (same as wiki-mcp)
+    "google-api-python-client>=2.100",
+    "google-auth>=2.20",
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "uvicorn>=0.30",
+    "starlette>=0.37",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+omos-mcp = "omos_mcp.server:main"
+omos-mcp-http = "omos_mcp.server:main_http"

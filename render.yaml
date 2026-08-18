@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: omos-mcp
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      # Shared bearer token clients must send. Render generates a strong value;
+      # copy it from the dashboard and give it to your team.
+      - key: OMOS_AUTH_TOKEN
+        generateValue: true
+      # Folder id of the OMOS shared drive root. Set manually in the dashboard.
+      - key: OMOS_ROOT_FOLDER_ID
+        sync: false
+      # Full JSON content of the service account key file. Set manually in the dashboard.
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false

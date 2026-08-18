@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "omos": {
+      "command": "uv",
+      "args": ["run", "--directory", ".", "omos-mcp"]
+    }
+  }
+}
