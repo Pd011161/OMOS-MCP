@@ -47,6 +47,8 @@ server เข้าถึง Drive ด้วย service account (ไม่ต้
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | เนื้อไฟล์ key JSON ทั้งก้อน หรือ path ไปยังไฟล์ — **บังคับ** |
 | `OMOS_AUTH_TOKEN` | (HTTP mode) bearer token ที่ client ต้องส่งมา |
 | `OMOS_INDEX_TTL` | อายุ cache ของรายชื่อโปรเจค เป็นวินาที (default 300) |
+| `OMOS_DEADLINE` | เวลาสูงสุดต่อ 1 tool call เป็นวินาที (default 20) — เกินแล้วคืนผลเท่าที่ได้พร้อมคำเตือน |
+| `OMOS_HTTP_TIMEOUT` | timeout ต่อ 1 request ที่ยิงไป Drive เป็นวินาที (default 20) |
 | `OAUTH_ISSUER` / `OAUTH_AUDIENCE` / `PUBLIC_URL` | (HTTP mode) เปิดโหมด OAuth สำหรับ Claude.ai / ChatGPT เว็บ |
 | `PORT` | (HTTP mode) port ที่ฟัง (default 8000) |
 
@@ -94,6 +96,24 @@ endpoint อยู่ที่ `http://localhost:8000/mcp` เชื่อมด
 ```bash
 claude mcp add --transport http omos http://localhost:8000/mcp -H "Authorization: Bearer <OMOS_AUTH_TOKEN>"
 ```
+
+## เรื่อง timeout
+
+Drive ใหญ่ + Render free tier ทำให้ tool call ถูก client ตัดได้ ฝั่ง server จัดการให้แล้ว: ทุก tool มี **deadline 20 วินาที** ถ้าไม่ทันจะ**คืนผลเท่าที่ได้พร้อมคำเตือนว่ายังไม่ครบ** (ไม่ใช่ error เปล่าๆ) ปรับได้ที่ `OMOS_DEADLINE`
+
+สองอย่างที่ต้องทำเองถ้ายังเจอ timeout:
+
+**1) ขยาย timeout ฝั่ง client** — Claude Code ตั้งได้ (หน่วยมิลลิวินาที):
+
+```bash
+claude mcp add --transport http omos https://<app>.onrender.com/mcp -e MCP_TOOL_TIMEOUT=120000
+```
+
+> Claude.ai เว็บ / Cowork ตั้งค่านี้ไม่ได้ — ต้องพึ่ง deadline ฝั่ง server อย่างเดียว
+
+**2) กัน Render หลับ** — free tier จะ spin down เมื่อไม่มีคนใช้ request แรกหลังหลับจะช้า 50 วินาทีขึ้นไป (มักโดน timeout พอดี) แก้ได้ 2 ทาง:
+- ตั้ง cron ฟรี (เช่น [cron-job.org](https://cron-job.org)) ยิง `https://<app>.onrender.com/healthz` ทุก 10 นาที
+- หรืออัพเป็น Render Starter (~$7/เดือน) แล้วไม่หลับเลย
 
 ## Deploy เป็น MCP link (Render)
 

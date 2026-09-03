@@ -28,6 +28,10 @@ _load_dotenv()
 OMOS_ROOT_FOLDER_ID = os.environ.get("OMOS_ROOT_FOLDER_ID", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 INDEX_TTL = int(os.environ.get("OMOS_INDEX_TTL", "300"))  # seconds
+# A tool call must always come back with something: clients cut the call off long
+# before a big drive walk finishes, and an error is worth less than partial results.
+DEADLINE = float(os.environ.get("OMOS_DEADLINE", "20"))  # seconds per tool call
+HTTP_TIMEOUT = float(os.environ.get("OMOS_HTTP_TIMEOUT", "20"))  # seconds per Drive request
 
 FOLDER_MT = "application/vnd.google-apps.folder"
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
@@ -84,7 +88,15 @@ def _svc():
         creds = service_account.Credentials.from_service_account_info(
             info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
         )
-        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        import google_auth_httplib2
+        import httplib2
+
+        drive = build(
+            "drive", "v3", cache_discovery=False,
+            http=google_auth_httplib2.AuthorizedHttp(
+                creds, http=httplib2.Http(timeout=HTTP_TIMEOUT)
+            ),
+        )
         _local.drive = drive
     return drive
 
@@ -269,17 +281,21 @@ def _omos_list(project: str, subfolder: str) -> str:
         )
 
     lines: list[str] = []
-    truncated = False
+    truncated = ""
+    deadline = time.monotonic() + DEADLINE
 
     def walk(folder_id: str, prefix: str, depth: int) -> None:
         nonlocal truncated
         if truncated:
             return
+        if time.monotonic() > deadline:
+            truncated = "time"
+            return
         kids = _list_children(folder_id)
         folders = [f for f in kids if f["mimeType"] == FOLDER_MT]
         for f in kids:
             if len(lines) >= MAX_LIST_ITEMS:
-                truncated = True
+                truncated = "size"
                 return
             indent = "  " * depth
             if f["mimeType"] == FOLDER_MT:
@@ -308,7 +324,14 @@ def _omos_list(project: str, subfolder: str) -> str:
     header = f"# {project}" + (f" / {subfolder}" if subfolder else "")
     if not lines:
         return f"{header}\n\n(empty)"
-    note = f"\n\n_Listing capped at {MAX_LIST_ITEMS} items — narrow with subfolder or use omos_search._" if truncated else ""
+    if truncated == "size":
+        note = (f"\n\n⚠️ _INCOMPLETE: stopped at {MAX_LIST_ITEMS} items — this is NOT the whole "
+                "project. Narrow it with subfolder=, or use omos_search(query, project)._")
+    elif truncated == "time":
+        note = (f"\n\n⚠️ _INCOMPLETE: stopped after {DEADLINE:.0f}s — this is NOT the whole "
+                "project. Narrow it with subfolder=, or use omos_search(query, project)._")
+    else:
+        note = ""
     return f"{header}\n\n" + "\n".join(lines) + note
 
 
@@ -332,6 +355,7 @@ def _omos_search(query: str, project: str) -> str:
     if project and project not in _projects["by_name"]:
         return f"Unknown project '{project}'. Call omos_index for the list."
 
+    deadline = time.monotonic() + DEADLINE
     q = query.replace("\\", "\\\\").replace("'", "\\'")
     files, token = [], None
     while True:
@@ -345,11 +369,15 @@ def _omos_search(query: str, project: str) -> str:
         ).execute()
         files += resp.get("files", [])
         token = resp.get("nextPageToken")
-        if not token or len(files) >= 200:
+        if not token or len(files) >= 200 or time.monotonic() > deadline:
             break
 
     results = []
+    timed_out = False
     for f in files:
+        if time.monotonic() > deadline:
+            timed_out = True
+            break
         path, proj = _path_of(f["name"], f.get("parents"))
         if project and proj != project:
             continue
@@ -359,8 +387,11 @@ def _omos_search(query: str, project: str) -> str:
 
     scope = f"project '{project}'" if project else "all projects"
     if not results:
-        return f"No files matching '{query}' in {scope}. Try another keyword or omos_list."
-    return f"Found {len(results)} file(s) matching '{query}' in {scope}:\n" + "\n".join(results)
+        hint = " (search was cut short by the time limit — try a narrower query or a project)" if timed_out else ""
+        return f"No files matching '{query}' in {scope}{hint}. Try another keyword or omos_list."
+    note = (f"\n\n⚠️ _Partial: search stopped after {DEADLINE:.0f}s — narrow the query or pass a "
+            "project to see the rest._") if timed_out else ""
+    return f"Found {len(results)} file(s) matching '{query}' in {scope}:\n" + "\n".join(results) + note
 
 
 @mcp.tool()
@@ -378,6 +409,17 @@ async def omos_read(file_id: str):
 
 
 def _omos_read(file_id: str):
+    try:
+        return _read(file_id)
+    except (TimeoutError, OSError) as exc:  # socket/HTTP timeouts from the Drive client
+        link = f"https://drive.google.com/file/d/{file_id}/view"
+        return (
+            f"Error: reading this file timed out after {HTTP_TIMEOUT:.0f}s ({exc}). "
+            f"It may be very large. Tell the user to open it directly: {link}"
+        )
+
+
+def _read(file_id: str):
     svc = _svc()
     meta = svc.files().get(
         fileId=file_id, fields="id,name,mimeType,webViewLink,size,parents", supportsAllDrives=True

@@ -146,5 +146,34 @@ with patch.object(server, "_list_children", lambda fid: hits.append(fid) or []):
     assert out.count("\n- ") == 13, "raised limit must show every project"
 assert hits == [], f"filtering must not hit the drive again: {hits}"
 
+# a slow drive must yield partial results with a warning, never a dead call
+server._projects.update(built_at=time.time(), by_name={"Slow": ["s1"]})
+slow_tree = {
+    "s1": [
+        {"id": "sf%d" % i, "name": "sub%d" % i, "mimeType": server.FOLDER_MT, "webViewLink": "l", "parents": ["s1"]}
+        for i in range(5)
+    ]
+}
+
+
+def _slow_children(folder_id):
+    time.sleep(0.05)
+    return slow_tree.get(folder_id, [])
+
+
+with patch.object(server, "DEADLINE", 0.12), \
+     patch.object(server, "_list_children", _slow_children):
+    started = time.monotonic()
+    out = server._omos_list("Slow", "")
+    elapsed = time.monotonic() - started
+assert elapsed < 2, f"listing must give up quickly, took {elapsed:.1f}s"
+assert "INCOMPLETE" in out and "stopped after" in out, out
+assert "sub0" in out, "partial listing must still return what it walked"
+
+# a read that times out must come back as guidance, not an exception
+with patch.object(server, "_read", lambda fid: (_ for _ in ()).throw(TimeoutError("timed out"))):
+    out = server._omos_read("abc123")
+assert "timed out" in out and "abc123" in out, out
+
 # ponytail: pdf extraction not self-checked — pypdf can't author text PDFs; covered by real-drive test
 print("ok")
