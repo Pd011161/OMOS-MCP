@@ -2,19 +2,14 @@
 
 MCP server ให้ AI agent (Claude, ChatGPT, Cursor ฯลฯ) อ่านเอกสารโปรเจคใน **OMOS Shared Drive** เพื่อตอบคำถาม — ทุกคำตอบอ้างอิงไฟล์ต้นทางพร้อม link Google Drive
 
-โครงสร้าง Drive ที่รองรับ:
+โครงสร้าง Drive: **โฟลเดอร์ชั้นบนสุด = 1 โปรเจค (ชื่อโฟลเดอร์คือชื่อโปรเจค)** ข้างในจะจัดยังไงก็ได้ ไม่บังคับ structure
 
 ```
 OMOS/
-├── Project A/
-│   ├── Project Overview/
-│   ├── Timeline/
-│   ├── Design/
-│   │   ├── System Flow/
-│   │   ├── DB/
-│   │   └── API/
-│   └── BRD/
-└── Project B/ ...
+├── Project A/   ← ชื่อโปรเจค
+│   └── ... (อะไรก็ได้)
+└── Project B/
+    └── ...
 ```
 
 ## Tools
@@ -26,7 +21,7 @@ OMOS/
 | `omos_read` | อ่านไฟล์เป็น text — Google Docs/Sheets/Slides, PDF, .docx, .xlsx, md/text และรูปภาพ (ส่งรูปให้ agent ดูตรงๆ) |
 | `omos_refresh` | rebuild index ทันที (ปกติ cache 5 นาที) |
 
-Agent จะไล่ค้นตามลำดับ: filter **Project Name** → ไม่เจอให้ดู **Project Overview** แล้วถามยืนยันกับ user → ไล่ต่อว่าถามถึง **Timeline | BRD | Design (System Flow / DB / API)** → คำถามกว้างไปจะถามกลับเพื่อลด scope (ฝังไว้ใน server instructions แล้ว)
+Agent จะไล่ค้นตามลำดับ: เทียบชื่อโปรเจคกับ**ชื่อโฟลเดอร์ชั้นบนสุด** → ไม่เจอให้เดาโปรเจคที่ใกล้เคียงแล้วถามยืนยันกับ user → ไล่ดูไฟล์ใน subtree ของโปรเจคนั้นจาก index → คำถามกว้างไปจะถามกลับเพื่อลด scope (ฝังไว้ใน server instructions แล้ว)
 
 ## ตั้งค่าครั้งเดียว: Service Account
 

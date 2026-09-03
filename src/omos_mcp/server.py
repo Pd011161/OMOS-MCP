@@ -35,17 +35,17 @@ INSTRUCTIONS = (
     "documents. USE THESE TOOLS (without being asked) whenever the user asks about any project, "
     "BRD, requirement, timeline, แผนงาน, กำหนดการ, system flow, database/DB schema, API spec, "
     "project overview, รายละเอียดโปรเจค, เอกสารโปรเจค, or mentions a project by name.\n"
-    "Every project folder follows this structure:\n"
-    "  <Project Name>/ -> Project Overview | Timeline | Design (System Flow, DB, API) | BRD\n\n"
+    "Each top-level folder is one project — the folder name IS the project name. "
+    "The structure inside each project varies; rely on the index, not on a fixed layout.\n\n"
     "How to answer questions:\n"
-    "1. ALWAYS call omos_index first, then filter by Project Name.\n"
-    "2. If no project name matches, look at the Project Overview of likely projects and "
-    "ASK THE USER TO CONFIRM which project they mean. If you can't guess, ask for the project name.\n"
-    "3. Identify what the user is asking about: Timeline, BRD, or Design "
-    "(System Flow / DB / API live under Design).\n"
+    "1. ALWAYS call omos_index first and match the user's project against the top-level "
+    "folder names.\n"
+    "2. If no folder name matches, pick the most likely project(s) from the index and "
+    "ASK THE USER TO CONFIRM which one they mean. If you can't guess, ask for the project name.\n"
+    "3. Browse that project's subtree in the index for relevant files; use omos_search for "
+    "keywords, omos_read to read a file.\n"
     "4. If the question is too broad, ask the user to narrow the scope before searching.\n"
-    "5. Use omos_search for keywords, omos_read to read a file.\n"
-    "6. EVERY answer must cite the source file(s) by name WITH the Google Drive link "
+    "5. EVERY answer must cite the source file(s) by name WITH the Google Drive link "
     "(provided in every tool response)."
 )
 
@@ -148,29 +148,45 @@ def _cite(file_id: str, name: str, link: str) -> str:
 
 
 # --- Tools ---
+# All tools are async and push the blocking Google API work into a worker thread:
+# FastMCP runs sync tools directly on the event loop, which froze /healthz during
+# long Drive walks and made Render kill the instance mid-call.
 
 
 @mcp.tool()
-def omos_index() -> str:
+async def omos_index() -> str:
     """Get the full index of the OMOS drive: every project and its files (with file ids and links).
     Use this whenever the user asks about any internal project, BRD, timeline, design,
-    system flow, DB, API, or เอกสารโปรเจค — ALWAYS call this first, then filter by
-    Project Name before drilling into Timeline / BRD / Design (System Flow, DB, API)."""
+    system flow, DB, API, or เอกสารโปรเจค — ALWAYS call this first. Each top-level
+    folder is one project (folder name = project name); match the user's project
+    against those names, then browse that project's subtree for relevant files."""
+    import anyio.to_thread
+
+    return await anyio.to_thread.run_sync(_omos_index)
+
+
+def _omos_index() -> str:
     _ensure_index()
     n = len(_cache["projects"])
     return _cache["markdown"] + f"\n\n_{n} project(s). Cite files with the links above._"
 
 
 @mcp.tool()
-def omos_search(query: str, project: str = "", section: str = "") -> str:
+async def omos_search(query: str, project: str = "", section: str = "") -> str:
     """Full-text search across the OMOS drive. Returns matching files with project path and link;
     use omos_read on the ids to read content.
 
     Args:
         query: keyword or phrase (searches file content and names)
-        project: optional exact project name from omos_index to narrow the search
-        section: optional section name (e.g. 'BRD', 'Timeline', 'Design', 'DB') to narrow further
+        project: optional exact top-level folder (project) name from omos_index to narrow the search
+        section: optional subfolder name inside the project to narrow further
     """
+    import anyio.to_thread
+
+    return await anyio.to_thread.run_sync(_omos_search, query, project, section)
+
+
+def _omos_search(query: str, project: str, section: str) -> str:
     _ensure_index()
     if project and project not in _cache["projects"]:
         names = ", ".join(sorted(_cache["projects"])) or "(no projects found)"
@@ -218,7 +234,7 @@ def omos_search(query: str, project: str = "", section: str = "") -> str:
 
 
 @mcp.tool()
-def omos_read(file_id: str):
+async def omos_read(file_id: str):
     """Read a file from the OMOS drive as text (Google Docs/Sheets/Slides, PDF, docx, xlsx,
     markdown/text) or as an image (png/jpg). The response starts with a citation block
     (file name, path, link) — always include that citation in your answer.
@@ -226,6 +242,12 @@ def omos_read(file_id: str):
     Args:
         file_id: the Drive file id from omos_index or omos_search
     """
+    import anyio.to_thread
+
+    return await anyio.to_thread.run_sync(_omos_read, file_id)
+
+
+def _omos_read(file_id: str):
     svc = _svc()
     meta = svc.files().get(
         fileId=file_id, fields="id,name,mimeType,webViewLink,size", supportsAllDrives=True
@@ -274,10 +296,12 @@ def omos_read(file_id: str):
 
 
 @mcp.tool()
-def omos_refresh() -> str:
+async def omos_refresh() -> str:
     """Rebuild the drive index so newly added projects/files show up immediately
     (the index is otherwise cached for a few minutes)."""
-    _build_index()
+    import anyio.to_thread
+
+    await anyio.to_thread.run_sync(_build_index)
     return f"Index rebuilt: {len(_cache['projects'])} project(s), {len(_cache['paths'])} item(s)."
 
 
