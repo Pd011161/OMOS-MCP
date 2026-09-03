@@ -74,5 +74,25 @@ with patch.object(server, "_build_index", _slow_build):
     [t.join() for t in threads]
 assert len(calls) == 1, f"index built {len(calls)} times, expected 1"
 
+# index build: parallel level fetch must still produce the correct nested tree
+_TREE = {
+    "root": [
+        {"id": "p1", "name": "Alpha", "mimeType": server.FOLDER_MT, "webViewLink": "l1"},
+        {"id": "p2", "name": "Beta", "mimeType": server.FOLDER_MT, "webViewLink": "l2"},
+    ],
+    "p1": [
+        {"id": "d1", "name": "Docs", "mimeType": server.FOLDER_MT, "webViewLink": "l3"},
+        {"id": "f1", "name": "top.md", "mimeType": "text/markdown", "webViewLink": "l4"},
+    ],
+    "d1": [{"id": "f2", "name": "deep.pdf", "mimeType": "application/pdf", "webViewLink": "l5"}],
+    "p2": [],
+}
+with patch.object(server, "OMOS_ROOT_FOLDER_ID", "root"), \
+     patch.object(server, "_list_children", lambda fid: _TREE.get(fid, [])):
+    server._build_index()
+assert set(server._cache["projects"]) == {"Alpha", "Beta"}, server._cache["projects"]
+assert server._cache["paths"]["f2"][0] == "Alpha / Docs / deep.pdf", server._cache["paths"]["f2"]
+assert "## Alpha" in server._cache["markdown"] and "deep.pdf" in server._cache["markdown"]
+
 # ponytail: pdf extraction not self-checked — pypdf can't author text PDFs; covered by real-drive test
 print("ok")

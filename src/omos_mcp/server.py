@@ -1,8 +1,10 @@
 import io
 import json
+import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -110,12 +112,30 @@ _cache: dict = {"built_at": 0.0, "markdown": "", "paths": {}, "projects": {}}
 
 
 def _build_index() -> None:
+    started = time.time()
     lines: list[str] = ["# OMOS Project Index", ""]
     paths: dict[str, tuple[str, str]] = {}
     projects: dict[str, str] = {}
 
+    # Fetch each level's folders in parallel: one sequential round trip per folder
+    # made the whole walk slower than the client's tool-call timeout.
+    children: dict[str, list[dict]] = {}
+    level = [OMOS_ROOT_FOLDER_ID]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for depth in range(7):  # ponytail: depth cap, raise if the drive nests deeper
+            if not level:
+                break
+            for folder_id, kids in zip(level, pool.map(_list_children, level)):
+                children[folder_id] = kids
+            level = [
+                f["id"]
+                for folder_id in level
+                for f in children[folder_id]
+                if f["mimeType"] == FOLDER_MT
+            ] if depth < 6 else []
+
     def walk(folder_id: str, prefix: str, depth: int) -> None:
-        for f in _list_children(folder_id):
+        for f in children.get(folder_id, []):
             path = f"{prefix} / {f['name']}" if prefix else f["name"]
             paths[f["id"]] = (path, f.get("webViewLink", ""))
             indent = "  " * depth
@@ -125,8 +145,7 @@ def _build_index() -> None:
                     lines.append(f"\n## {f['name']}")
                 else:
                     lines.append(f"{indent}- 📁 {f['name']}")
-                if depth < 6:  # ponytail: depth cap, raise if the drive ever nests deeper
-                    walk(f["id"], path, depth + 1)
+                walk(f["id"], path, depth + 1)
             else:
                 lines.append(
                     f"{indent}- 📄 {f['name']} — id: `{f['id']}` — [link]({f.get('webViewLink', '')})"
@@ -138,6 +157,10 @@ def _build_index() -> None:
         markdown="\n".join(lines),
         paths=paths,
         projects=projects,
+    )
+    logging.getLogger("omos_mcp").info(
+        "index built in %.1fs: %d project(s), %d folder(s), %d item(s)",
+        time.time() - started, len(projects), len(children), len(paths),
     )
 
 
