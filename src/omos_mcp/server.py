@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -54,12 +55,15 @@ mcp = FastMCP("omos-mcp", instructions=INSTRUCTIONS)
 
 # --- Google Drive client ---
 
-_drive = None
+# google-api-python-client is not thread-safe: sharing one client across the
+# worker threads corrupts the TLS connection ("[SSL] record layer failure"),
+# so each thread gets its own.
+_local = threading.local()
 
 
 def _svc():
-    global _drive
-    if _drive is None:
+    drive = getattr(_local, "drive", None)
+    if drive is None:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
 
@@ -74,8 +78,9 @@ def _svc():
         creds = service_account.Credentials.from_service_account_info(
             info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
         )
-        _drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-    return _drive
+        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        _local.drive = drive
+    return drive
 
 
 _FILE_FIELDS = "id,name,mimeType,webViewLink"
@@ -136,9 +141,16 @@ def _build_index() -> None:
     )
 
 
+# ponytail: one global lock — index builds are rare; per-project locks if that changes
+_index_lock = threading.Lock()
+
+
 def _ensure_index() -> None:
-    if time.time() - _cache["built_at"] > INDEX_TTL:
-        _build_index()
+    if time.time() - _cache["built_at"] <= INDEX_TTL:
+        return
+    with _index_lock:
+        if time.time() - _cache["built_at"] > INDEX_TTL:  # another thread may have built it
+            _build_index()
 
 
 def _cite(file_id: str, name: str, link: str) -> str:
