@@ -41,10 +41,13 @@ INSTRUCTIONS = (
     "Each top-level folder is one project — the folder name IS the project name. The layout "
     "inside a project varies; there is no fixed structure to assume.\n\n"
     "The drive holds hundreds of projects and tens of thousands of files, so work top-down:\n"
-    "1. omos_index — the list of project names. ALWAYS start here.\n"
-    "2. Match the user's wording against those names. If nothing matches clearly, pick the "
-    "likeliest candidates and ASK THE USER TO CONFIRM; if you cannot guess, ask for the project "
-    "name. Never guess silently.\n"
+    "1. omos_index(filter=<keyword the user said>) — finds projects by name. ALWAYS start here, "
+    "and ALWAYS pass a filter when the user named or hinted at a project: without one you get a "
+    "small sample, not the whole drive, so never conclude a project is missing from that sample. "
+    "Try a shorter keyword before giving up.\n"
+    "2. Match the user's wording against the names you get back. If nothing matches clearly, pick "
+    "the likeliest candidates and ASK THE USER TO CONFIRM; if you cannot guess, ask for the "
+    "project name. Never guess silently.\n"
     "3. omos_list(project) — the files inside that project (add subfolder= to narrow a big one).\n"
     "4. omos_search(query, project) — keyword search, scoped to a project whenever you know it.\n"
     "5. omos_read(file_id) — read a file you picked in step 3 or 4.\n"
@@ -173,24 +176,64 @@ def _cite(name: str, parents: list[str] | None, link: str) -> str:
 
 
 @mcp.tool()
-async def omos_index() -> str:
-    """List every project in the OMOS drive (one project = one top-level folder).
-    ALWAYS call this first when the user asks about any project, BRD, timeline, design,
-    system flow, DB, API, or เอกสารโปรเจค: match what they said against these names,
-    then call omos_list with the matching project name to see its files."""
+async def omos_index(filter: str = "", limit: int = 10) -> str:
+    """Find projects in the OMOS drive (one project = one top-level folder). ALWAYS call
+    this first when the user asks about any project, BRD, timeline, design, system flow,
+    DB, API, or เอกสารโปรเจค.
+
+    The drive holds hundreds of projects, so PASS A FILTER: a word from what the user
+    said (Thai or English, matched anywhere in the name). Without one you only get a
+    small sample, not the whole drive. Then call omos_list with the exact name you matched.
+
+    Args:
+        filter: keyword to match against project names — pass this whenever the user
+            named or hinted at a project
+        limit: how many names to return (default 10; raise it only when the user
+            explicitly asks for the full list of projects)
+    """
     import anyio.to_thread
 
-    return await anyio.to_thread.run_sync(_omos_index)
+    return await anyio.to_thread.run_sync(_omos_index, filter, limit)
 
 
-def _omos_index() -> str:
+MAX_INDEX_LIMIT = 500
+
+
+def _omos_index(filter: str = "", limit: int = 10) -> str:
     _ensure_projects()
-    names = sorted(_projects["by_name"])
-    listing = "\n".join(f"- {n}" + ("  ⚠️ (duplicate name)" if len(_projects["by_name"][n]) > 1 else "")
-                        for n in names)
+    all_names = sorted(_projects["by_name"])
+    limit = max(1, min(limit, MAX_INDEX_LIMIT))
+    needle = filter.strip().lower()
+    names = [n for n in all_names if needle in n.lower()] if needle else all_names
+
+    if needle and not names:
+        return (
+            f"No project name contains '{filter}' ({len(all_names)} projects total). "
+            "Try a shorter or different keyword, or ask the user for the exact project name."
+        )
+
+    shown = names[:limit]
+    listing = "\n".join(
+        f"- {n}" + ("  ⚠️ (duplicate name)" if len(_projects["by_name"][n]) > 1 else "")
+        for n in shown
+    )
+    if needle:
+        header = f"# Projects matching '{filter}' ({len(names)} of {len(all_names)})"
+        more = (
+            f"\n\n_Showing {len(shown)} of {len(names)} matches — raise limit or use a "
+            "more specific keyword to see the rest._" if len(names) > len(shown) else ""
+        )
+    else:
+        header = f"# OMOS projects — sample of {len(shown)} (out of {len(all_names)})"
+        more = (
+            f"\n\n⚠️ _These {len(shown)} are only a sample of {len(all_names)} projects, NOT the "
+            "whole drive. To find a specific project call omos_index with filter=<keyword from "
+            "the user>. Only raise limit if the user really wants the full list._"
+        ) if len(all_names) > len(shown) else ""
+
     return (
-        f"# OMOS projects ({len(names)})\n\n{listing}\n\n"
-        "_Call omos_list(project) to see a project's files, or omos_search(query, project) "
+        f"{header}\n\n{listing}{more}\n\n"
+        "_Then call omos_list(project) for a project's files, or omos_search(query, project) "
         "to search inside one._"
     )
 

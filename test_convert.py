@@ -124,5 +124,27 @@ with patch.object(server, "OMOS_ROOT_FOLDER_ID", ROOT), \
     assert (path, project) == ("Alpha / Docs / deep.pdf", "Alpha"), (path, project)
     assert server._cite("deep.pdf", ["d1"], "l5").startswith("📄 **deep.pdf**")
 
+# a drive with more projects than the limit: the bare index returns a sample that says
+# so and points at filter=, and a keyword finds a project anywhere in the name
+many = {f"Project {i:02d}": ["id%d" % i] for i in range(12)}
+many["AI CPAC"] = ["idc"]
+server._projects.update(built_at=time.time(), by_name=many)
+hits = []
+with patch.object(server, "_list_children", lambda fid: hits.append(fid) or []):
+    out = server._omos_index()
+    assert out.count("\n- ") == 10, f"bare index must cap at 10, got {out.count(chr(10) + '- ')}"
+    assert "sample" in out and "filter=" in out, out
+    assert "Project 11" not in out, "a sample must not pretend to be the whole list"
+
+    out = server._omos_index("cpac")
+    assert "AI CPAC" in out and "Project 00" not in out, out
+
+    out = server._omos_index("zzz")
+    assert "No project name contains" in out, out
+
+    out = server._omos_index("", 50)
+    assert out.count("\n- ") == 13, "raised limit must show every project"
+assert hits == [], f"filtering must not hit the drive again: {hits}"
+
 # ponytail: pdf extraction not self-checked — pypdf can't author text PDFs; covered by real-drive test
 print("ok")

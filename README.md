@@ -16,7 +16,7 @@ OMOS/
 
 | Tool | คำอธิบาย |
 |------|----------|
-| `omos_index` | รายชื่อโปรเจคทั้งหมด (ชื่อโฟลเดอร์ชั้นบนสุด) — ยิง Drive ครั้งเดียว agent เรียกอันนี้ก่อนเสมอ |
+| `omos_index` | หาโปรเจคจากชื่อ — ใส่ `filter` = คำที่ผู้ใช้พูด (ไทย/อังกฤษ) ไม่ใส่จะได้แค่ตัวอย่าง 10 ชื่อ (ปรับ `limit` ได้) agent เรียกอันนี้ก่อนเสมอ |
 | `omos_list` | ไฟล์ทั้งหมดในโปรเจคที่ระบุ พร้อม id + link (ใส่ `subfolder` เพื่อดูเฉพาะบางส่วน) |
 | `omos_search` | ค้นหา full-text ทั้ง Drive หรือเจาะเฉพาะโปรเจค |
 | `omos_read` | อ่านไฟล์เป็น text — Google Docs/Sheets/Slides, PDF, .docx, .xlsx, md/text — ส่วนรูปภาพส่งเป็นรูปให้ agent ดูตรงๆ |
@@ -24,7 +24,9 @@ OMOS/
 
 Drive จริงมีหลักร้อยโปรเจคและไฟล์หลักหมื่น server จึงไม่เดินทั้ง Drive: อ่านเฉพาะที่ถูกถามถึง — `omos_index` = 1 API call, `omos_list` เดินเฉพาะ subtree ของโปรเจคนั้น, path ของผลลัพธ์ search/read resolve ทีละไฟล์ตอนใช้จริง
 
-Flow ที่ฝังไว้ใน server instructions: `omos_index` → เทียบชื่อโปรเจค (ไม่ชัดให้ถามยืนยัน ห้ามเดาเงียบๆ) → `omos_list` หรือ `omos_search` เจาะโปรเจคนั้น → `omos_read` → ทุกคำตอบต้องอ้างอิงชื่อไฟล์พร้อม link
+Flow ที่ฝังไว้ใน server instructions: `omos_index(filter=คำที่ผู้ใช้พูด)` → เทียบชื่อโปรเจค (ไม่ชัดให้ถามยืนยัน ห้ามเดาเงียบๆ) → `omos_list` หรือ `omos_search` เจาะโปรเจคนั้น → `omos_read` → ทุกคำตอบต้องอ้างอิงชื่อไฟล์พร้อม link
+
+Drive จริงมีเกือบ 500 โปรเจค การเทชื่อทั้งหมดใส่ context ไม่ช่วยให้หาเจอ `omos_index` จึงเน้นให้ค้นด้วย `filter` แทน
 
 ## ตั้งค่าครั้งเดียว: Service Account
 
