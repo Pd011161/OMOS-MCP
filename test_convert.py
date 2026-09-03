@@ -58,41 +58,71 @@ with patch.object(server, "OMOS_ROOT_FOLDER_ID", "x"), \
     [t.join() for t in threads]
 assert len(builds) == 4, f"expected 1 client per thread (4), got {len(builds)}"
 
+# concurrent callers must not each rebuild the project list
 calls = []
 
 
-def _slow_build():
-    calls.append(1)
+def _slow_list(folder_id):
+    calls.append(folder_id)
     time.sleep(0.1)
-    server._cache["built_at"] = time.time()
+    return []
 
 
-server._cache["built_at"] = 0
-with patch.object(server, "_build_index", _slow_build):
-    threads = [threading.Thread(target=server._ensure_index) for _ in range(4)]
+server._projects.update(built_at=0.0, by_name={})
+with patch.object(server, "_list_children", _slow_list):
+    threads = [threading.Thread(target=server._ensure_projects) for _ in range(4)]
     [t.start() for t in threads]
     [t.join() for t in threads]
-assert len(calls) == 1, f"index built {len(calls)} times, expected 1"
+assert len(calls) == 1, f"project list built {len(calls)} times, expected 1"
 
-# index build: parallel level fetch must still produce the correct nested tree
+# project list: one API call, names only — the drive has hundreds of projects and
+# tens of thousands of files, so nothing may walk it whole
+ROOT = "root"
 _TREE = {
-    "root": [
-        {"id": "p1", "name": "Alpha", "mimeType": server.FOLDER_MT, "webViewLink": "l1"},
-        {"id": "p2", "name": "Beta", "mimeType": server.FOLDER_MT, "webViewLink": "l2"},
+    ROOT: [
+        {"id": "p1", "name": "Alpha", "mimeType": server.FOLDER_MT, "webViewLink": "l1", "parents": [ROOT]},
+        {"id": "p2", "name": "Beta", "mimeType": server.FOLDER_MT, "webViewLink": "l2", "parents": [ROOT]},
+        {"id": "f0", "name": "loose.md", "mimeType": "text/markdown", "webViewLink": "l0", "parents": [ROOT]},
     ],
     "p1": [
-        {"id": "d1", "name": "Docs", "mimeType": server.FOLDER_MT, "webViewLink": "l3"},
-        {"id": "f1", "name": "top.md", "mimeType": "text/markdown", "webViewLink": "l4"},
+        {"id": "d1", "name": "Docs", "mimeType": server.FOLDER_MT, "webViewLink": "l3", "parents": ["p1"]},
+        {"id": "f1", "name": "top.md", "mimeType": "text/markdown", "webViewLink": "l4", "parents": ["p1"]},
     ],
-    "d1": [{"id": "f2", "name": "deep.pdf", "mimeType": "application/pdf", "webViewLink": "l5"}],
+    "d1": [{"id": "f2", "name": "deep.pdf", "mimeType": "application/pdf", "webViewLink": "l5", "parents": ["d1"]}],
     "p2": [],
 }
-with patch.object(server, "OMOS_ROOT_FOLDER_ID", "root"), \
-     patch.object(server, "_list_children", lambda fid: _TREE.get(fid, [])):
-    server._build_index()
-assert set(server._cache["projects"]) == {"Alpha", "Beta"}, server._cache["projects"]
-assert server._cache["paths"]["f2"][0] == "Alpha / Docs / deep.pdf", server._cache["paths"]["f2"]
-assert "## Alpha" in server._cache["markdown"] and "deep.pdf" in server._cache["markdown"]
+listed = []
+
+
+def _fake_children(folder_id):
+    listed.append(folder_id)
+    return _TREE.get(folder_id, [])
+
+
+server._projects.update(built_at=0.0, by_name={})
+server._folders.clear()
+with patch.object(server, "OMOS_ROOT_FOLDER_ID", ROOT), \
+     patch.object(server, "_list_children", _fake_children):
+    out = server._omos_index()
+    assert listed == [ROOT], f"index must hit the drive once, hit: {listed}"
+    assert "Alpha" in out and "Beta" in out, out
+    assert "deep.pdf" not in out and "loose.md" not in out, "index must list project names only"
+
+    # one project's subtree only — Beta is never touched
+    listed.clear()
+    out = server._omos_list("Alpha", "")
+    assert "top.md" in out and "deep.pdf" in out and "📁 Docs" in out, out
+    assert "p2" not in listed, f"listing Alpha must not walk other projects: {listed}"
+
+    out = server._omos_list("Nope", "")
+    assert "Unknown project" in out, out
+    assert "deep.pdf" in server._omos_list("Alpha", "Docs"), "subfolder listing failed"
+
+    # search resolves each hit's path by walking parents, no full index
+    with patch.object(server, "_svc", lambda: None):
+        path, project = server._path_of("deep.pdf", ["d1"])
+    assert (path, project) == ("Alpha / Docs / deep.pdf", "Alpha"), (path, project)
+    assert server._cite("deep.pdf", ["d1"], "l5").startswith("📄 **deep.pdf**")
 
 # ponytail: pdf extraction not self-checked — pypdf can't author text PDFs; covered by real-drive test
 print("ok")

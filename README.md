@@ -16,12 +16,15 @@ OMOS/
 
 | Tool | คำอธิบาย |
 |------|----------|
-| `omos_index` | index ทั้ง Drive: ทุกโปรเจค + ทุกไฟล์ พร้อม id และ link (agent เรียกอันนี้ก่อนเสมอ) |
-| `omos_search` | ค้นหา full-text ทั้ง Drive จำกัด scope ตามโปรเจค/section ได้ |
-| `omos_read` | อ่านไฟล์เป็น text — Google Docs/Sheets/Slides, PDF, .docx, .xlsx, md/text และรูปภาพ (ส่งรูปให้ agent ดูตรงๆ) |
-| `omos_refresh` | rebuild index ทันที (ปกติ cache 5 นาที) |
+| `omos_index` | รายชื่อโปรเจคทั้งหมด (ชื่อโฟลเดอร์ชั้นบนสุด) — ยิง Drive ครั้งเดียว agent เรียกอันนี้ก่อนเสมอ |
+| `omos_list` | ไฟล์ทั้งหมดในโปรเจคที่ระบุ พร้อม id + link (ใส่ `subfolder` เพื่อดูเฉพาะบางส่วน) |
+| `omos_search` | ค้นหา full-text ทั้ง Drive หรือเจาะเฉพาะโปรเจค |
+| `omos_read` | อ่านไฟล์เป็น text — Google Docs/Sheets/Slides, PDF, .docx, .xlsx, md/text — ส่วนรูปภาพส่งเป็นรูปให้ agent ดูตรงๆ |
+| `omos_refresh` | โหลดรายชื่อโปรเจคใหม่ทันที (ปกติ cache 5 นาที) |
 
-Agent จะไล่ค้นตามลำดับ: เทียบชื่อโปรเจคกับ**ชื่อโฟลเดอร์ชั้นบนสุด** → ไม่เจอให้เดาโปรเจคที่ใกล้เคียงแล้วถามยืนยันกับ user → ไล่ดูไฟล์ใน subtree ของโปรเจคนั้นจาก index → คำถามกว้างไปจะถามกลับเพื่อลด scope (ฝังไว้ใน server instructions แล้ว)
+Drive จริงมีหลักร้อยโปรเจคและไฟล์หลักหมื่น server จึงไม่เดินทั้ง Drive: อ่านเฉพาะที่ถูกถามถึง — `omos_index` = 1 API call, `omos_list` เดินเฉพาะ subtree ของโปรเจคนั้น, path ของผลลัพธ์ search/read resolve ทีละไฟล์ตอนใช้จริง
+
+Flow ที่ฝังไว้ใน server instructions: `omos_index` → เทียบชื่อโปรเจค (ไม่ชัดให้ถามยืนยัน ห้ามเดาเงียบๆ) → `omos_list` หรือ `omos_search` เจาะโปรเจคนั้น → `omos_read` → ทุกคำตอบต้องอ้างอิงชื่อไฟล์พร้อม link
 
 ## ตั้งค่าครั้งเดียว: Service Account
 
@@ -41,7 +44,7 @@ server เข้าถึง Drive ด้วย service account (ไม่ต้
 | `OMOS_ROOT_FOLDER_ID` | folder id ของ root OMOS (จากขั้นตอนที่ 6) — **บังคับ** |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | เนื้อไฟล์ key JSON ทั้งก้อน หรือ path ไปยังไฟล์ — **บังคับ** |
 | `OMOS_AUTH_TOKEN` | (HTTP mode) bearer token ที่ client ต้องส่งมา |
-| `OMOS_INDEX_TTL` | อายุ cache ของ index เป็นวินาที (default 300) |
+| `OMOS_INDEX_TTL` | อายุ cache ของรายชื่อโปรเจค เป็นวินาที (default 300) |
 | `OAUTH_ISSUER` / `OAUTH_AUDIENCE` / `PUBLIC_URL` | (HTTP mode) เปิดโหมด OAuth สำหรับ Claude.ai / ChatGPT เว็บ |
 | `PORT` | (HTTP mode) port ที่ฟัง (default 8000) |
 
@@ -76,7 +79,7 @@ Claude Desktop / Cursor / Windsurf — ใส่ใน MCP config:
 }
 ```
 
-**3) ทดสอบ:** ถาม agent ว่า *"มีโปรเจคอะไรบ้างใน OMOS"* — ต้องได้รายชื่อโปรเจคพร้อม link
+**3) ทดสอบ:** ถาม agent ว่า *"มีโปรเจคอะไรบ้างใน OMOS"* — ต้องได้รายชื่อโปรเจค แล้วถามต่อเจาะโปรเจคใดโปรเจคหนึ่งต้องได้ไฟล์พร้อม link
 
 **(ทางเลือก) รันเป็น HTTP server ในเครื่อง:** เปิด `OMOS_AUTH_TOKEN` ใน `.env` แล้ว
 
@@ -121,7 +124,7 @@ Cursor / VS Code: ใส่ URL + header `Authorization: Bearer <token>` ใน 
 
 > โหมด OAuth กับ bearer token อยู่ด้วยกันได้ — เว็บใช้ OAuth, CLI ยังใช้ token ได้
 
-## ทดสอบ converters
+## ทดสอบ (converters + thread safety + การอ่านแบบ lazy)
 
 ```bash
 uv run python test_convert.py

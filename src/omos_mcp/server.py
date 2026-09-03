@@ -38,17 +38,18 @@ INSTRUCTIONS = (
     "documents. USE THESE TOOLS (without being asked) whenever the user asks about any project, "
     "BRD, requirement, timeline, แผนงาน, กำหนดการ, system flow, database/DB schema, API spec, "
     "project overview, รายละเอียดโปรเจค, เอกสารโปรเจค, or mentions a project by name.\n"
-    "Each top-level folder is one project — the folder name IS the project name. "
-    "The structure inside each project varies; rely on the index, not on a fixed layout.\n\n"
-    "How to answer questions:\n"
-    "1. ALWAYS call omos_index first and match the user's project against the top-level "
-    "folder names.\n"
-    "2. If no folder name matches, pick the most likely project(s) from the index and "
-    "ASK THE USER TO CONFIRM which one they mean. If you can't guess, ask for the project name.\n"
-    "3. Browse that project's subtree in the index for relevant files; use omos_search for "
-    "keywords, omos_read to read a file.\n"
-    "4. If the question is too broad, ask the user to narrow the scope before searching.\n"
-    "5. EVERY answer must cite the source file(s) by name WITH the Google Drive link "
+    "Each top-level folder is one project — the folder name IS the project name. The layout "
+    "inside a project varies; there is no fixed structure to assume.\n\n"
+    "The drive holds hundreds of projects and tens of thousands of files, so work top-down:\n"
+    "1. omos_index — the list of project names. ALWAYS start here.\n"
+    "2. Match the user's wording against those names. If nothing matches clearly, pick the "
+    "likeliest candidates and ASK THE USER TO CONFIRM; if you cannot guess, ask for the project "
+    "name. Never guess silently.\n"
+    "3. omos_list(project) — the files inside that project (add subfolder= to narrow a big one).\n"
+    "4. omos_search(query, project) — keyword search, scoped to a project whenever you know it.\n"
+    "5. omos_read(file_id) — read a file you picked in step 3 or 4.\n"
+    "If the question is too broad, ask the user to narrow it before searching. "
+    "EVERY answer must cite the source file(s) by name WITH the Google Drive link "
     "(provided in every tool response)."
 )
 
@@ -85,7 +86,7 @@ def _svc():
     return drive
 
 
-_FILE_FIELDS = "id,name,mimeType,webViewLink"
+_FILE_FIELDS = "id,name,mimeType,webViewLink,parents"
 
 
 def _list_children(folder_id: str) -> list[dict]:
@@ -106,79 +107,62 @@ def _list_children(folder_id: str) -> list[dict]:
             return files
 
 
-# --- Index cache ---
-# _paths: file/folder id -> ("Project A / Design / DB / schema.pdf", webViewLink)
-_cache: dict = {"built_at": 0.0, "markdown": "", "paths": {}, "projects": {}}
+# --- Caches ---
+# The drive holds hundreds of projects and tens of thousands of files, so nothing
+# walks it whole: the project list is one API call, and paths are resolved only
+# for the handful of files a search or read actually touches.
+_projects: dict = {"built_at": 0.0, "by_name": {}}  # name -> [folder ids]
+_folders: dict[str, tuple[str, str]] = {}  # folder id -> (name, parent id)
+_lock = threading.Lock()
 
 
-def _build_index() -> None:
-    started = time.time()
-    lines: list[str] = ["# OMOS Project Index", ""]
-    paths: dict[str, tuple[str, str]] = {}
-    projects: dict[str, str] = {}
-
-    # Fetch each level's folders in parallel: one sequential round trip per folder
-    # made the whole walk slower than the client's tool-call timeout.
-    children: dict[str, list[dict]] = {}
-    level = [OMOS_ROOT_FOLDER_ID]
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for depth in range(7):  # ponytail: depth cap, raise if the drive nests deeper
-            if not level:
-                break
-            for folder_id, kids in zip(level, pool.map(_list_children, level)):
-                children[folder_id] = kids
-            level = [
-                f["id"]
-                for folder_id in level
-                for f in children[folder_id]
-                if f["mimeType"] == FOLDER_MT
-            ] if depth < 6 else []
-
-    def walk(folder_id: str, prefix: str, depth: int) -> None:
-        for f in children.get(folder_id, []):
-            path = f"{prefix} / {f['name']}" if prefix else f["name"]
-            paths[f["id"]] = (path, f.get("webViewLink", ""))
-            indent = "  " * depth
-            if f["mimeType"] == FOLDER_MT:
-                if depth == 0:
-                    projects[f["name"]] = f["id"]
-                    lines.append(f"\n## {f['name']}")
-                else:
-                    lines.append(f"{indent}- 📁 {f['name']}")
-                walk(f["id"], path, depth + 1)
-            else:
-                lines.append(
-                    f"{indent}- 📄 {f['name']} — id: `{f['id']}` — [link]({f.get('webViewLink', '')})"
-                )
-
-    walk(OMOS_ROOT_FOLDER_ID, "", 0)
-    _cache.update(
-        built_at=time.time(),
-        markdown="\n".join(lines),
-        paths=paths,
-        projects=projects,
-    )
-    logging.getLogger("omos_mcp").info(
-        "index built in %.1fs: %d project(s), %d folder(s), %d item(s)",
-        time.time() - started, len(projects), len(children), len(paths),
-    )
-
-
-# ponytail: one global lock — index builds are rare; per-project locks if that changes
-_index_lock = threading.Lock()
-
-
-def _ensure_index() -> None:
-    if time.time() - _cache["built_at"] <= INDEX_TTL:
+def _ensure_projects() -> None:
+    if time.time() - _projects["built_at"] <= INDEX_TTL:
         return
-    with _index_lock:
-        if time.time() - _cache["built_at"] > INDEX_TTL:  # another thread may have built it
-            _build_index()
+    with _lock:
+        if time.time() - _projects["built_at"] <= INDEX_TTL:
+            return  # another thread just built it
+        started = time.time()
+        by_name: dict[str, list[str]] = {}
+        for f in _list_children(OMOS_ROOT_FOLDER_ID):
+            if f["mimeType"] == FOLDER_MT:
+                by_name.setdefault(f["name"].strip(), []).append(f["id"])
+                _folders[f["id"]] = (f["name"].strip(), OMOS_ROOT_FOLDER_ID)
+        _projects.update(built_at=time.time(), by_name=by_name)
+        logging.getLogger("omos_mcp").info(
+            "project list built in %.1fs: %d project(s)", time.time() - started, len(by_name)
+        )
 
 
-def _cite(file_id: str, name: str, link: str) -> str:
-    _ensure_index()
-    path = _cache["paths"].get(file_id, (name, ""))[0]
+def _folder(folder_id: str) -> tuple[str, str]:
+    """(name, parent id) for a folder, cached — folder names never change often."""
+    hit = _folders.get(folder_id)
+    if hit is None:
+        meta = _svc().files().get(
+            fileId=folder_id, fields="id,name,parents", supportsAllDrives=True
+        ).execute()
+        parents = meta.get("parents") or [""]
+        hit = (meta.get("name", "?"), parents[0])
+        _folders[folder_id] = hit
+    return hit
+
+
+def _path_of(name: str, parents: list[str] | None) -> tuple[str, str]:
+    """Resolve ("Project / Sub / file.md", "Project") by walking parents up to the root."""
+    chain: list[str] = []
+    fid = (parents or [""])[0]
+    for _ in range(8):  # ponytail: depth cap, matches the drive's real nesting
+        if not fid or fid == OMOS_ROOT_FOLDER_ID:
+            break
+        folder_name, fid = _folder(fid)
+        chain.append(folder_name)
+    chain.reverse()
+    project = chain[0] if chain else ""
+    return " / ".join([*chain, name]), project
+
+
+def _cite(name: str, parents: list[str] | None, link: str) -> str:
+    path, _ = _path_of(name, parents)
     return f"📄 **{name}**\n📁 {path}\n🔗 {link}\n\n---\n\n"
 
 
@@ -190,42 +174,120 @@ def _cite(file_id: str, name: str, link: str) -> str:
 
 @mcp.tool()
 async def omos_index() -> str:
-    """Get the full index of the OMOS drive: every project and its files (with file ids and links).
-    Use this whenever the user asks about any internal project, BRD, timeline, design,
-    system flow, DB, API, or เอกสารโปรเจค — ALWAYS call this first. Each top-level
-    folder is one project (folder name = project name); match the user's project
-    against those names, then browse that project's subtree for relevant files."""
+    """List every project in the OMOS drive (one project = one top-level folder).
+    ALWAYS call this first when the user asks about any project, BRD, timeline, design,
+    system flow, DB, API, or เอกสารโปรเจค: match what they said against these names,
+    then call omos_list with the matching project name to see its files."""
     import anyio.to_thread
 
     return await anyio.to_thread.run_sync(_omos_index)
 
 
 def _omos_index() -> str:
-    _ensure_index()
-    n = len(_cache["projects"])
-    return _cache["markdown"] + f"\n\n_{n} project(s). Cite files with the links above._"
+    _ensure_projects()
+    names = sorted(_projects["by_name"])
+    listing = "\n".join(f"- {n}" + ("  ⚠️ (duplicate name)" if len(_projects["by_name"][n]) > 1 else "")
+                        for n in names)
+    return (
+        f"# OMOS projects ({len(names)})\n\n{listing}\n\n"
+        "_Call omos_list(project) to see a project's files, or omos_search(query, project) "
+        "to search inside one._"
+    )
 
 
 @mcp.tool()
-async def omos_search(query: str, project: str = "", section: str = "") -> str:
-    """Full-text search across the OMOS drive. Returns matching files with project path and link;
-    use omos_read on the ids to read content.
+async def omos_list(project: str, subfolder: str = "") -> str:
+    """List the files and folders inside ONE project, with file ids and Drive links.
+    Call this after omos_index, using an exact project name from it.
 
     Args:
-        query: keyword or phrase (searches file content and names)
-        project: optional exact top-level folder (project) name from omos_index to narrow the search
-        section: optional subfolder name inside the project to narrow further
+        project: exact project name from omos_index
+        subfolder: optional folder name inside the project to list only that part
     """
     import anyio.to_thread
 
-    return await anyio.to_thread.run_sync(_omos_search, query, project, section)
+    return await anyio.to_thread.run_sync(_omos_list, project, subfolder)
 
 
-def _omos_search(query: str, project: str, section: str) -> str:
-    _ensure_index()
-    if project and project not in _cache["projects"]:
-        names = ", ".join(sorted(_cache["projects"])) or "(no projects found)"
-        return f"Unknown project '{project}'. Available projects: {names}"
+MAX_LIST_ITEMS = 500
+
+
+def _omos_list(project: str, subfolder: str) -> str:
+    _ensure_projects()
+    ids = _projects["by_name"].get(project.strip())
+    if not ids:
+        close = [n for n in _projects["by_name"] if project.strip().lower() in n.lower()]
+        hint = ("\nDid you mean: " + ", ".join(sorted(close)[:10])) if close else ""
+        return f"Unknown project '{project}'. Call omos_index for the list.{hint}"
+    if len(ids) > 1:
+        return (
+            f"'{project}' matches {len(ids)} different folders with the same name. "
+            "Ask the user which one they mean; ids: " + ", ".join(ids)
+        )
+
+    lines: list[str] = []
+    truncated = False
+
+    def walk(folder_id: str, prefix: str, depth: int) -> None:
+        nonlocal truncated
+        if truncated:
+            return
+        kids = _list_children(folder_id)
+        folders = [f for f in kids if f["mimeType"] == FOLDER_MT]
+        for f in kids:
+            if len(lines) >= MAX_LIST_ITEMS:
+                truncated = True
+                return
+            indent = "  " * depth
+            if f["mimeType"] == FOLDER_MT:
+                _folders[f["id"]] = (f["name"].strip(), folder_id)
+                lines.append(f"{indent}- 📁 {f['name']}")
+            else:
+                lines.append(
+                    f"{indent}- 📄 {f['name']} — id: `{f['id']}` — [link]({f.get('webViewLink', '')})"
+                )
+        if depth < 6:  # ponytail: depth cap, matches the drive's real nesting
+            for f in folders:
+                walk(f["id"], f"{prefix} / {f['name']}", depth + 1)
+
+    root = ids[0]
+    if subfolder:
+        match = next(
+            (f for f in _list_children(root)
+             if f["mimeType"] == FOLDER_MT and f["name"].strip().lower() == subfolder.strip().lower()),
+            None,
+        )
+        if match is None:
+            return f"'{subfolder}' not found in project '{project}'. Call omos_list('{project}') to see its folders."
+        root = match["id"]
+
+    walk(root, project, 0)
+    header = f"# {project}" + (f" / {subfolder}" if subfolder else "")
+    if not lines:
+        return f"{header}\n\n(empty)"
+    note = f"\n\n_Listing capped at {MAX_LIST_ITEMS} items — narrow with subfolder or use omos_search._" if truncated else ""
+    return f"{header}\n\n" + "\n".join(lines) + note
+
+
+@mcp.tool()
+async def omos_search(query: str, project: str = "") -> str:
+    """Full-text search across the OMOS drive (file content and names). Returns matching
+    files with their project path, id and link; read one with omos_read.
+
+    Args:
+        query: keyword or phrase
+        project: optional exact project name from omos_index to search only inside it
+    """
+    import anyio.to_thread
+
+    return await anyio.to_thread.run_sync(_omos_search, query, project)
+
+
+def _omos_search(query: str, project: str) -> str:
+    _ensure_projects()
+    project = project.strip()
+    if project and project not in _projects["by_name"]:
+        return f"Unknown project '{project}'. Call omos_index for the list."
 
     q = query.replace("\\", "\\\\").replace("'", "\\'")
     files, token = [], None
@@ -240,31 +302,21 @@ def _omos_search(query: str, project: str, section: str) -> str:
         ).execute()
         files += resp.get("files", [])
         token = resp.get("nextPageToken")
-        if not token or len(files) >= 300:
+        if not token or len(files) >= 200:
             break
 
-    # Scope by path prefix using the index (Drive queries can't filter by subtree).
     results = []
     for f in files:
-        entry = _cache["paths"].get(f["id"])
-        if entry is None:
-            _build_index()  # new file not in cache yet
-            entry = _cache["paths"].get(f["id"])
-            if entry is None:
-                continue  # outside the OMOS root
-        path = entry[0]
-        parts = [p.strip() for p in path.split(" / ")]
-        if project and (not parts or parts[0] != project):
+        path, proj = _path_of(f["name"], f.get("parents"))
+        if project and proj != project:
             continue
-        if section and section not in parts[1:-1]:
-            continue
-        results.append(f"- 📄 {f['name']} — {path} — id: `{f['id']}` — [link]({f.get('webViewLink', '')})")
+        results.append(f"- 📄 {path} — id: `{f['id']}` — [link]({f.get('webViewLink', '')})")
         if len(results) >= 20:
             break
 
-    scope = " / ".join(x for x in (project, section) if x) or "all projects"
+    scope = f"project '{project}'" if project else "all projects"
     if not results:
-        return f"No files matching '{query}' in {scope}. Try a broader query or check omos_index."
+        return f"No files matching '{query}' in {scope}. Try another keyword or omos_list."
     return f"Found {len(results)} file(s) matching '{query}' in {scope}:\n" + "\n".join(results)
 
 
@@ -285,10 +337,10 @@ async def omos_read(file_id: str):
 def _omos_read(file_id: str):
     svc = _svc()
     meta = svc.files().get(
-        fileId=file_id, fields="id,name,mimeType,webViewLink,size", supportsAllDrives=True
+        fileId=file_id, fields="id,name,mimeType,webViewLink,size,parents", supportsAllDrives=True
     ).execute()
     mt, name = meta["mimeType"], meta["name"]
-    cite = _cite(file_id, name, meta.get("webViewLink", ""))
+    cite = _cite(name, meta.get("parents"), meta.get("webViewLink", ""))
 
     if int(meta.get("size", 0)) > MAX_DOWNLOAD_BYTES:
         return cite + f"Error: file is too large to read ({meta['size']} bytes). Open it via the link."
@@ -332,12 +384,14 @@ def _omos_read(file_id: str):
 
 @mcp.tool()
 async def omos_refresh() -> str:
-    """Rebuild the drive index so newly added projects/files show up immediately
-    (the index is otherwise cached for a few minutes)."""
+    """Reload the project list so newly added projects show up immediately
+    (it is otherwise cached for a few minutes)."""
     import anyio.to_thread
 
-    await anyio.to_thread.run_sync(_build_index)
-    return f"Index rebuilt: {len(_cache['projects'])} project(s), {len(_cache['paths'])} item(s)."
+    _projects["built_at"] = 0.0
+    _folders.clear()
+    await anyio.to_thread.run_sync(_ensure_projects)
+    return f"Project list reloaded: {len(_projects['by_name'])} project(s)."
 
 
 # --- File converters ---
@@ -474,7 +528,7 @@ def _build_http_server(**kwargs) -> FastMCP:
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
         **kwargs,
     )
-    for fn in (omos_index, omos_search, omos_read, omos_refresh):
+    for fn in (omos_index, omos_list, omos_search, omos_read, omos_refresh):
         server.tool()(fn)
     return server
 
