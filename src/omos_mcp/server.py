@@ -32,8 +32,18 @@ INDEX_TTL = int(os.environ.get("OMOS_INDEX_TTL", "300"))  # seconds
 # before a big drive walk finishes, and an error is worth less than partial results.
 DEADLINE = float(os.environ.get("OMOS_DEADLINE", "20"))  # seconds per tool call
 HTTP_TIMEOUT = float(os.environ.get("OMOS_HTTP_TIMEOUT", "20"))  # seconds per Drive request
+# Machine ingestion (meeting transcripts) authenticates with its own token: a bot
+# cannot do the OAuth dance, and this can be revoked without touching MCP access.
+INGEST_TOKEN = os.environ.get("OMOS_INGEST_TOKEN", "")
+TRANSCRIPT_FOLDER = os.environ.get("OMOS_TRANSCRIPT_FOLDER", "Meeting Transcripts")
+MAX_TRANSCRIPT_BYTES = 10 * 1024 * 1024
 
 FOLDER_MT = "application/vnd.google-apps.folder"
+DOC_MT = "application/vnd.google-apps.document"
+# Write access is needed to file transcripts. This module only ever calls
+# files().create() — no update, no delete, no trash — and only inside a folder
+# it has already resolved from the project list.
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_TEXT_CHARS = 50_000
 
@@ -86,7 +96,7 @@ def _svc():
             Path(raw).expanduser().read_text(encoding="utf-8")
         )
         creds = service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+            info, scopes=[DRIVE_SCOPE]
         )
         import google_auth_httplib2
         import httplib2
@@ -129,6 +139,7 @@ def _list_children(folder_id: str) -> list[dict]:
 _projects: dict = {"built_at": 0.0, "by_name": {}}  # name -> [folder ids]
 _folders: dict[str, tuple[str, str]] = {}  # folder id -> (name, parent id)
 _lock = threading.Lock()
+_create_lock = threading.Lock()  # serialises transcript-folder creation
 
 
 def _ensure_projects() -> None:
@@ -517,6 +528,127 @@ def _read_xlsx(data: bytes) -> str:
     return "\n\n".join(parts)
 
 
+class IngestError(Exception):
+    """A refused ingestion: carries the HTTP status the caller should see."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _resolve_project_folder(project: str) -> str:
+    """The one folder id for this project name, or refuse. Never guesses."""
+    _ensure_projects()
+    ids = _projects["by_name"].get(project.strip())
+    if not ids:
+        raise IngestError(404, f"Unknown project '{project}'. It must match a top-level folder name exactly.")
+    if len(ids) > 1:
+        raise IngestError(
+            409,
+            f"'{project}' matches {len(ids)} folders with the same name — refusing to guess. "
+            "Send a project name that is unique, or have someone rename the duplicates.",
+        )
+    return ids[0]
+
+
+def _transcript_folder(project_folder_id: str) -> str:
+    """Find (or create once) the transcripts subfolder inside a project."""
+    with _create_lock:  # ponytail: global lock — creation is rare, keeps concurrent posts from racing
+        existing = [
+            f for f in _list_children(project_folder_id)
+            if f["mimeType"] == FOLDER_MT and f["name"].strip() == TRANSCRIPT_FOLDER
+        ]
+        if existing:
+            return existing[0]["id"]
+        created = _svc().files().create(
+            body={"name": TRANSCRIPT_FOLDER, "mimeType": FOLDER_MT, "parents": [project_folder_id]},
+            fields="id",
+            supportsAllDrives=True,
+        ).execute()
+        return created["id"]
+
+
+def _existing_transcript(folder_id: str, meeting_id: str, name: str) -> dict | None:
+    """The already-filed copy of this meeting, if any — retries must not duplicate."""
+    if meeting_id:
+        q = (
+            f"'{folder_id}' in parents and trashed=false and "
+            f"appProperties has {{ key='meeting_id' and value='{meeting_id}' }}"
+        )
+    else:  # no id from the caller: fall back to the deterministic file name
+        q = f"'{folder_id}' in parents and trashed=false and name='{name}'"
+    found = _svc().files().list(
+        q=q, fields="files(id,name,webViewLink)", pageSize=1,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+    return found[0] if found else None
+
+
+def _doc_body(title: str, date: str, transcript: str, translation: str, meeting_id: str) -> str:
+    header = [f"{title}", f"Meeting date: {date}"]
+    if meeting_id:
+        header.append(f"Meeting ID: {meeting_id}")
+    parts = ["\n".join(header), "", "## Transcript", transcript.strip()]
+    if translation.strip():
+        parts += ["", "## Translation", translation.strip()]
+    return "\n".join(parts)
+
+
+def save_transcript(payload: dict) -> dict:
+    """File a meeting transcript into its project folder. Creates, never overwrites."""
+    from googleapiclient.http import MediaInMemoryUpload
+
+    missing = [k for k in ("project", "title", "date", "transcript") if not str(payload.get(k, "")).strip()]
+    if missing:
+        raise IngestError(400, "Missing required field(s): " + ", ".join(missing))
+
+    project = str(payload["project"]).strip()
+    title = str(payload["title"]).strip()
+    date = str(payload["date"]).strip()
+    transcript = str(payload["transcript"])
+    translation = str(payload.get("translation") or "")
+    meeting_id = str(payload.get("meeting_id") or "").strip()
+
+    body = _doc_body(title, date, transcript, translation, meeting_id)
+    if len(body.encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
+        raise IngestError(400, f"Transcript is larger than {MAX_TRANSCRIPT_BYTES // (1024 * 1024)} MB.")
+
+    folder_id = _transcript_folder(_resolve_project_folder(project))
+    name = f"{date} — {title}"
+
+    hit = _existing_transcript(folder_id, meeting_id, name)
+    if hit:
+        logging.getLogger("omos_mcp").info(
+            "transcript already filed: project=%r meeting_id=%r file=%s", project, meeting_id, hit["id"]
+        )
+        return {
+            "status": "exists", "file_id": hit["id"], "link": hit.get("webViewLink", ""),
+            "folder": f"{project} / {TRANSCRIPT_FOLDER}",
+        }
+
+    created = _svc().files().create(
+        body={
+            "name": name,
+            "mimeType": DOC_MT,  # Drive converts the uploaded text into a Google Doc
+            "parents": [folder_id],
+            "appProperties": {"meeting_id": meeting_id, "source": "omos-ingest"},
+        },
+        media_body=MediaInMemoryUpload(body.encode("utf-8"), mimetype="text/plain", resumable=False),
+        fields="id,webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+
+    logging.getLogger("omos_mcp").info(
+        "transcript filed: project=%r meeting_id=%r date=%s file=%s",
+        project, meeting_id, date, created["id"],
+    )
+    return {
+        "status": "created", "file_id": created["id"], "link": created.get("webViewLink", ""),
+        "folder": f"{project} / {TRANSCRIPT_FOLDER}",
+    }
+
+
 def main():
     mcp.run(transport="stdio")
 
@@ -646,6 +778,40 @@ def main_http():
     async def health(_request: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
 
+    async def transcripts(request: Request) -> JSONResponse:
+        """Machine ingestion for meeting transcripts (n0ngjik -> OMOS -> Drive).
+
+        Authenticated here rather than by middleware: the OAuth mode has no static
+        bearer check at all, so relying on it would leave this route wide open.
+        """
+        import anyio.to_thread
+
+        log = logging.getLogger("omos_mcp.ingest")
+        header = request.headers.get("authorization", "")
+        provided = header[7:] if header.startswith("Bearer ") else ""
+        if not INGEST_TOKEN or not hmac.compare_digest(provided, INGEST_TOKEN):
+            log.warning("ingest rejected: bad or missing token")
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse({"error": "body must be JSON"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+        try:
+            result = await anyio.to_thread.run_sync(save_transcript, payload)
+        except IngestError as exc:
+            log.warning("ingest refused (%d): %s | project=%r meeting_id=%r",
+                        exc.status, exc.message, payload.get("project"), payload.get("meeting_id"))
+            return JSONResponse({"error": exc.message}, status_code=exc.status)
+        except Exception as exc:  # Drive failure: the caller should retry
+            log.exception("ingest failed: project=%r meeting_id=%r",
+                          payload.get("project"), payload.get("meeting_id"))
+            return JSONResponse({"error": f"drive error: {exc}"}, status_code=502)
+        return JSONResponse(result)
+
+    ingest_route = Route("/transcripts", transcripts, methods=["POST"])
+
     if issuer:
         if not (audience and public_url):
             raise SystemExit(
@@ -663,6 +829,7 @@ def main_http():
         )
         app = server.streamable_http_app()
         app.router.routes.append(Route("/healthz", health, methods=["GET"]))
+        app.router.routes.append(ingest_route)
     else:
         if not token:
             raise SystemExit(
@@ -672,7 +839,9 @@ def main_http():
 
         class BearerAuth(BaseHTTPMiddleware):
             async def dispatch(self, request: Request, call_next):
-                if request.url.path == "/healthz":
+                # /transcripts carries its own token check (machine callers use
+                # OMOS_INGEST_TOKEN, not the MCP token)
+                if request.url.path in ("/healthz", "/transcripts"):
                     return await call_next(request)
                 header = request.headers.get("authorization", "")
                 provided = header[7:] if header.startswith("Bearer ") else ""
@@ -682,6 +851,7 @@ def main_http():
 
         app = _build_http_server().streamable_http_app()
         app.router.routes.append(Route("/healthz", health, methods=["GET"]))
+        app.router.routes.append(ingest_route)
         app.add_middleware(BearerAuth)
 
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))

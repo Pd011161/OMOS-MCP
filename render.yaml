@@ -15,3 +15,7 @@ services:
       # Full JSON content of the service account key file. Set manually in the dashboard.
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         sync: false
+      # Token the transcript ingestion caller (น้องจิก) must send to POST /transcripts.
+      # Separate from the MCP token so it can be revoked on its own.
+      - key: OMOS_INGEST_TOKEN
+        generateValue: true

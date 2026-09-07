@@ -36,7 +36,7 @@ server เข้าถึง Drive ด้วย service account (ไม่ต้
 2. **APIs & Services → Library** → ค้นหา **Google Drive API** → กด **Enable**
 3. **IAM & Admin → Service Accounts → Create Service Account** → ตั้งชื่อ เช่น `omos-mcp` → กด Create (ข้ามขั้นตอน role ได้เลย ไม่ต้องให้สิทธิ์อะไร)
 4. เข้า service account ที่สร้าง → แท็บ **Keys → Add Key → Create new key → JSON** → ไฟล์ key จะดาวน์โหลดมา
-5. copy อีเมลของ service account (หน้าตา `omos-mcp@<project>.iam.gserviceaccount.com`) ไป**แชร์ Shared Drive / โฟลเดอร์ OMOS** ให้อีเมลนี้เป็น **Viewer**
+5. copy อีเมลของ service account (หน้าตา `omos-mcp@<project>.iam.gserviceaccount.com`) ไป**แชร์ Shared Drive / โฟลเดอร์ OMOS** ให้อีเมลนี้เป็น **Viewer** (ถ้าจะใช้ [รับ transcript อัตโนมัติ](#รับ-transcript-อัตโนมัติ-post-transcripts) ต้องให้เป็น **Content manager** เพราะต้องเขียนไฟล์ได้)
 6. หา **folder id** ของ root OMOS: เปิดโฟลเดอร์ใน browser แล้วดู URL `https://drive.google.com/drive/folders/<อันนี้คือ id>`
 
 ## Environment Variables
@@ -47,6 +47,8 @@ server เข้าถึง Drive ด้วย service account (ไม่ต้
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | เนื้อไฟล์ key JSON ทั้งก้อน หรือ path ไปยังไฟล์ — **บังคับ** |
 | `OMOS_AUTH_TOKEN` | (HTTP mode) bearer token ที่ client ต้องส่งมา |
 | `OMOS_INDEX_TTL` | อายุ cache ของรายชื่อโปรเจค เป็นวินาที (default 300) |
+| `OMOS_INGEST_TOKEN` | token สำหรับ `POST /transcripts` (แยกจาก MCP token) — ไม่ตั้ง = endpoint ปิดใช้งาน |
+| `OMOS_TRANSCRIPT_FOLDER` | ชื่อ subfolder ที่เก็บ transcript (default `Meeting Transcripts`) |
 | `OMOS_DEADLINE` | เวลาสูงสุดต่อ 1 tool call เป็นวินาที (default 20) — เกินแล้วคืนผลเท่าที่ได้พร้อมคำเตือน |
 | `OMOS_HTTP_TIMEOUT` | timeout ต่อ 1 request ที่ยิงไป Drive เป็นวินาที (default 20) |
 | `OAUTH_ISSUER` / `OAUTH_AUDIENCE` / `PUBLIC_URL` | (HTTP mode) เปิดโหมด OAuth สำหรับ Claude.ai / ChatGPT เว็บ |
@@ -96,6 +98,47 @@ endpoint อยู่ที่ `http://localhost:8000/mcp` เชื่อมด
 ```bash
 claude mcp add --transport http omos http://localhost:8000/mcp -H "Authorization: Bearer <OMOS_AUTH_TOKEN>"
 ```
+
+## รับ Transcript อัตโนมัติ (`POST /transcripts`)
+
+สำหรับให้ระบบอื่น (เช่น **น้องจิก**) ส่ง transcript หลังประชุมจบ แล้ว OMOS หาโฟลเดอร์โปรเจคให้เอง บันทึกเป็น **Google Doc** ใน `<Project>/Meeting Transcripts/`
+
+```bash
+curl -X POST https://<app>.onrender.com/transcripts \
+  -H "Authorization: Bearer $OMOS_INGEST_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project": "To Do List",
+    "title": "Weekly sync",
+    "date": "2026-09-03",
+    "transcript": "...",
+    "meeting_id": "zoom-8891",
+    "translation": "..."
+  }'
+```
+
+| field | บังคับ | หมายเหตุ |
+|---|---|---|
+| `project` | ✅ | ต้องตรงกับชื่อโฟลเดอร์ชั้นบนสุด **เป๊ะๆ** — ไม่มี fuzzy match |
+| `title` / `date` | ✅ | ใช้ตั้งชื่อไฟล์: `2026-09-03 — Weekly sync` |
+| `transcript` | ✅ | สูงสุด 10 MB |
+| `meeting_id` | ➖ | **ควรส่ง** — ใช้กันไฟล์ซ้ำตอน retry |
+| `translation` | ➖ | ต่อท้ายเป็นอีก section ในไฟล์เดียวกัน |
+
+ตอบกลับ `{"status": "created"｜"exists", "file_id", "link", "folder"}`
+
+| status | ความหมาย | ฝั่งผู้เรียกควรทำ |
+|---|---|---|
+| `200` | บันทึกแล้ว หรือเคยบันทึกไว้แล้ว (`exists`) | จบ |
+| `400` | ข้อมูลไม่ครบ / ใหญ่เกิน | แก้ payload ห้าม retry ซ้ำๆ |
+| `401` | token ผิด | ตรวจ config |
+| `404` | ไม่รู้จักชื่อโปรเจค | ให้คนตรวจ — **OMOS จะไม่เดาให้** |
+| `409` | ชื่อโปรเจคซ้ำกันในไดรฟ์ ตัดสินไม่ได้ | ให้คนตรวจ/เปลี่ยนชื่อโฟลเดอร์ |
+| `502` | Drive มีปัญหา | retry ได้ |
+
+> **ความปลอดภัย:** endpoint นี้เขียนไฟล์ได้ ต้องตั้ง `OMOS_INGEST_TOKEN` ถึงจะทำงาน (ไม่ตั้ง = ตอบ 401 ทุก request) และโค้ด**สร้างไฟล์ใหม่อย่างเดียว ไม่มี update/delete** เขียนได้เฉพาะในโฟลเดอร์โปรเจคที่ resolve ได้แล้วเท่านั้น
+>
+> ⚠️ ฟีเจอร์นี้ต้องให้ service account มีสิทธิ์ **Content manager** (เขียนได้) บน Shared Drive และ scope เปลี่ยนเป็น `drive` — ถ้าใช้แค่ฝั่งอ่าน ไม่ต้องตั้ง `OMOS_INGEST_TOKEN` ก็ได้
 
 ## เรื่อง timeout
 
@@ -150,4 +193,5 @@ Cursor / VS Code: ใส่ URL + header `Authorization: Bearer <token>` ใน 
 
 ```bash
 uv run python test_convert.py
+uv run python test_ingest.py
 ```
