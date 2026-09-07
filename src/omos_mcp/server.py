@@ -574,6 +574,35 @@ class IngestError(Exception):
         self.message = message
 
 
+def _drive_failure(exc: Exception) -> tuple[int, str, bool]:
+    """(status, message, retryable) for a Drive failure.
+
+    Retrying a quota or permission error never succeeds, and a caller that keeps
+    retrying one just hammers the API forever — so those come back as their own
+    permanent statuses, separate from the transient failures worth another try.
+    """
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    detail = str(exc)
+    if status == 403 and "storageQuotaExceeded" in detail:
+        return 507, (
+            "Drive storage quota exceeded. The target must live in a Shared Drive: a "
+            "service account has no storage of its own, so files it creates in a "
+            "personal My Drive folder are rejected. Do not retry — this needs a fix in Drive."
+        ), False
+    if status == 403 and ("rateLimit" in detail or "userRateLimit" in detail):
+        return 429, f"Drive rate limit hit: {detail}", True
+    if status == 403:
+        return 403, (
+            f"Drive refused the write (permission): {detail}. The service account needs "
+            "Content manager on the drive. Do not retry until access is granted."
+        ), False
+    if status == 404:
+        return 404, f"Drive could not find the target folder: {detail}", False
+    if status == 429 or (status is not None and status >= 500):
+        return 502, f"Drive is failing right now: {detail}", True
+    return 502, f"drive error: {detail}", True
+
+
 def _resolve_project_folder(project: str) -> str:
     """The one folder id for this project name, or refuse. Never guesses."""
     _ensure_projects()
@@ -837,23 +866,24 @@ def main_http():
         provided = header[7:] if header.startswith("Bearer ") else ""
         if not INGEST_TOKEN or not hmac.compare_digest(provided, INGEST_TOKEN):
             log.warning("ingest rejected: bad or missing token")
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
+            return JSONResponse({"error": "unauthorized", "retryable": False}, status_code=401)
         try:
             payload = await request.json()
         except Exception:
-            return JSONResponse({"error": "body must be JSON"}, status_code=400)
+            return JSONResponse({"error": "body must be JSON", "retryable": False}, status_code=400)
         if not isinstance(payload, dict):
-            return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+            return JSONResponse({"error": "body must be a JSON object", "retryable": False}, status_code=400)
         try:
             result = await anyio.to_thread.run_sync(save_transcript, payload)
-        except IngestError as exc:
+        except IngestError as exc:  # bad request: retrying the same payload cannot help
             log.warning("ingest refused (%d): %s | project=%r meeting_id=%r",
                         exc.status, exc.message, payload.get("project"), payload.get("meeting_id"))
-            return JSONResponse({"error": exc.message}, status_code=exc.status)
-        except Exception as exc:  # Drive failure: the caller should retry
-            log.exception("ingest failed: project=%r meeting_id=%r",
-                          payload.get("project"), payload.get("meeting_id"))
-            return JSONResponse({"error": f"drive error: {exc}"}, status_code=502)
+            return JSONResponse({"error": exc.message, "retryable": False}, status_code=exc.status)
+        except Exception as exc:
+            status, message, retryable = _drive_failure(exc)
+            log.exception("ingest failed (%d, retryable=%s): project=%r meeting_id=%r",
+                          status, retryable, payload.get("project"), payload.get("meeting_id"))
+            return JSONResponse({"error": message, "retryable": retryable}, status_code=status)
         return JSONResponse(result)
 
     ingest_route = Route("/transcripts", transcripts, methods=["POST"])
@@ -892,7 +922,7 @@ def main_http():
                 header = request.headers.get("authorization", "")
                 provided = header[7:] if header.startswith("Bearer ") else ""
                 if not hmac.compare_digest(provided, token):
-                    return JSONResponse({"error": "unauthorized"}, status_code=401)
+                    return JSONResponse({"error": "unauthorized", "retryable": False}, status_code=401)
                 return await call_next(request)
 
         app = _build_http_server().streamable_http_app()

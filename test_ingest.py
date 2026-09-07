@@ -139,6 +139,34 @@ assert "A: one\n\nB: two\n\nC: three" in multi, multi
 assert "## Translation" in body and "แปลไทย" in body
 assert "## Translation" not in server._doc_body("T", "d", "x", "", "")
 
+# --- Drive failures must say whether retrying can ever help ---
+class FakeResp:
+    def __init__(self, status):
+        self.status = status
+
+
+def drive_error(status, detail):
+    exc = Exception(detail)
+    exc.resp = FakeResp(status)
+    return exc
+
+
+quota = drive_error(403, "The user's Drive storage quota has been exceeded. storageQuotaExceeded")
+st, msg, retry = server._drive_failure(quota)
+assert (st, retry) == (507, False), (st, retry)
+assert "Shared Drive" in msg, msg
+
+st, _, retry = server._drive_failure(drive_error(403, "insufficientFilePermissions"))
+assert (st, retry) == (403, False)
+st, _, retry = server._drive_failure(drive_error(403, "userRateLimitExceeded"))
+assert (st, retry) == (429, True)
+st, _, retry = server._drive_failure(drive_error(404, "File not found"))
+assert (st, retry) == (404, False)
+st, _, retry = server._drive_failure(drive_error(503, "backendError"))
+assert (st, retry) == (502, True)
+st, _, retry = server._drive_failure(TimeoutError("timed out"))
+assert (st, retry) == (502, True), "an unknown failure is worth one more try"
+
 # --- auth: the route must reject a bad token in BOTH auth modes ---
 import asyncio  # noqa: E402
 
@@ -190,5 +218,18 @@ for oauth_mode in (True, False):
     with svc:
         resp = asyncio.run(endpoint(FakeRequest("test-token", {**GOOD, "project": "Nope"})))
     assert resp.status_code == 404, resp.status_code
+    assert json.loads(resp.body)["retryable"] is False
+
+    # a permanent Drive failure must not invite an endless retry loop
+    with patch.object(server, "save_transcript", lambda p: (_ for _ in ()).throw(quota)):
+        resp = asyncio.run(endpoint(FakeRequest("test-token")))
+    assert resp.status_code == 507, resp.status_code
+    assert json.loads(resp.body)["retryable"] is False
+
+    # a transient one may be retried
+    with patch.object(server, "save_transcript",
+                      lambda p: (_ for _ in ()).throw(drive_error(503, "backendError"))):
+        resp = asyncio.run(endpoint(FakeRequest("test-token")))
+    assert resp.status_code == 502 and json.loads(resp.body)["retryable"] is True
 
 print("ok")
