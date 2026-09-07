@@ -90,6 +90,7 @@ assert doc_call[1]["body"]["parents"] == [SUB_ID], "doc must go in the transcrip
 assert doc_call[1]["body"]["mimeType"] == server.DOC_MT, "must be a Google Doc"
 assert doc_call[1]["body"]["name"] == "2026-09-03 — Weekly sync", doc_call[1]["body"]["name"]
 assert doc_call[1]["body"]["appProperties"]["meeting_id"] == "zoom-1"
+assert doc_call[1]["media_body"].mimetype() == "text/markdown", "upload as markdown so Drive makes real headings"
 
 # --- an existing subfolder is reused, not created again ---
 existing_sub = {"id": SUB_ID, "name": "Meeting Transcripts", "mimeType": server.FOLDER_MT}
@@ -129,8 +130,12 @@ refuses({**GOOD, "transcript": "x" * (server.MAX_TRANSCRIPT_BYTES + 1)}, 400)
 
 # --- the document body carries what a reader needs ---
 body = server._doc_body("T", "2026-09-03", "line one", "แปลไทย", "zoom-9")
+assert body.startswith("# T"), "title must be a markdown heading Drive can convert"
 assert "Meeting date: 2026-09-03" in body and "Meeting ID: zoom-9" in body
 assert "## Transcript" in body and "line one" in body
+# speaker turns must survive as separate paragraphs, not run together
+multi = server._doc_body("T", "d", "A: one\nB: two\n\nC: three", "", "")
+assert "A: one\n\nB: two\n\nC: three" in multi, multi
 assert "## Translation" in body and "แปลไทย" in body
 assert "## Translation" not in server._doc_body("T", "d", "x", "", "")
 

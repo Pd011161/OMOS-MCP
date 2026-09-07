@@ -10,15 +10,33 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP, Image
 
 
+def _parse_env(text: str) -> dict[str, str]:
+    """Parse .env text. Values may span lines: a service account key pasted straight
+    out of the JSON file is the normal case, and truncating it at the first newline
+    fails later with a confusing JSON parse error."""
+    out: dict[str, str] = {}
+    key, buf = "", ""
+    for line in text.splitlines():
+        if not key:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, buf = stripped.split("=", 1)
+            key, buf = key.strip(), buf.strip()
+        else:
+            buf += line.strip()
+        if buf.count("{") == buf.count("}"):  # complete value (no braces, or balanced)
+            out[key] = buf.strip("'\"")
+            key, buf = "", ""
+    return out
+
+
 def _load_dotenv() -> None:
     # ponytail: stdlib .env loader (repo root or cwd), real env always wins
     for p in (Path(__file__).resolve().parents[2] / ".env", Path(".env")):
         if p.is_file():
-            for line in p.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+            for k, v in _parse_env(p.read_text(encoding="utf-8")).items():
+                os.environ.setdefault(k, v)
             return
 
 
@@ -92,9 +110,7 @@ def _svc():
         raw = GOOGLE_SERVICE_ACCOUNT_JSON
         if not raw:
             raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set (JSON content or a file path).")
-        info = json.loads(raw) if raw.lstrip().startswith("{") else json.loads(
-            Path(raw).expanduser().read_text(encoding="utf-8")
-        )
+        info = _service_account_info(raw)
         creds = service_account.Credentials.from_service_account_info(
             info, scopes=[DRIVE_SCOPE]
         )
@@ -109,6 +125,27 @@ def _svc():
         )
         _local.drive = drive
     return drive
+
+
+def _service_account_info(raw: str) -> dict:
+    """The key as a dict, from inline JSON or a file path.
+
+    Pasting the key around often escapes it one level ({\\"type\\": ...), which
+    otherwise fails deep inside the Drive client with an opaque parse error.
+    """
+    if not raw.lstrip().startswith("{"):
+        return json.loads(Path(raw).expanduser().read_text(encoding="utf-8"))
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    try:  # unescape exactly one level, then parse
+        return json.loads(json.loads(f'"{raw}"'))
+    except Exception:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON. Paste the key file's "
+            "contents verbatim (or set the path to the file instead)."
+        ) from None
 
 
 _FILE_FIELDS = "id,name,mimeType,webViewLink,parents"
@@ -586,13 +623,22 @@ def _existing_transcript(folder_id: str, meeting_id: str, name: str) -> dict | N
 
 
 def _doc_body(title: str, date: str, transcript: str, translation: str, meeting_id: str) -> str:
-    header = [f"{title}", f"Meeting date: {date}"]
+    # Markdown, not plain text: Drive turns it into real headings on import, so the
+    # doc reads like a document instead of showing literal "##".
+    header = [f"# {title}", "", f"Meeting date: {date}"]
     if meeting_id:
         header.append(f"Meeting ID: {meeting_id}")
-    parts = ["\n".join(header), "", "## Transcript", transcript.strip()]
+    parts = ["\n".join(header), "", "## Transcript", _as_paragraphs(transcript)]
     if translation.strip():
-        parts += ["", "## Translation", translation.strip()]
+        parts += ["", "## Translation", _as_paragraphs(translation)]
     return "\n".join(parts)
+
+
+def _as_paragraphs(text: str) -> str:
+    """One line per speaker turn. Markdown folds single newlines into the same
+    paragraph, which would run every speaker's line together in the Doc."""
+    lines = [line.strip() for line in text.strip().splitlines()]
+    return "\n\n".join(line for line in lines if line)
 
 
 def save_transcript(payload: dict) -> dict:
@@ -634,7 +680,7 @@ def save_transcript(payload: dict) -> dict:
             "parents": [folder_id],
             "appProperties": {"meeting_id": meeting_id, "source": "omos-ingest"},
         },
-        media_body=MediaInMemoryUpload(body.encode("utf-8"), mimetype="text/plain", resumable=False),
+        media_body=MediaInMemoryUpload(body.encode("utf-8"), mimetype="text/markdown", resumable=False),
         fields="id,webViewLink",
         supportsAllDrives=True,
     ).execute()
