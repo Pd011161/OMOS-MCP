@@ -64,8 +64,10 @@ FOLDER_MT = "application/vnd.google-apps.folder"
 DOC_MT = "application/vnd.google-apps.document"
 # Write access is needed to file transcripts. This module only ever calls
 # files().create() — no update, no delete, no trash — and only inside a folder
-# it has already resolved from the project list.
-DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+# it has already resolved from the project list. With ingestion off there is
+# nothing to write, so the key cannot be used to change the drive at all.
+DRIVE_SCOPE = ("https://www.googleapis.com/auth/drive" if INGEST_TOKEN
+               else "https://www.googleapis.com/auth/drive.readonly")
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_TEXT_CHARS = 50_000
 
@@ -930,7 +932,8 @@ def main_http():
         )
         app = server.streamable_http_app()
         app.router.routes.append(Route("/healthz", health, methods=["GET"]))
-        app.router.routes.append(ingest_route)
+        if INGEST_TOKEN:
+            app.router.routes.append(ingest_route)
     else:
         if not token:
             raise SystemExit(
@@ -952,7 +955,8 @@ def main_http():
 
         app = _build_http_server().streamable_http_app()
         app.router.routes.append(Route("/healthz", health, methods=["GET"]))
-        app.router.routes.append(ingest_route)
+        if INGEST_TOKEN:
+            app.router.routes.append(ingest_route)
         app.add_middleware(BearerAuth)
 
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))

@@ -184,8 +184,8 @@ def route_of(app, path):
     return next(r for r in app.router.routes if getattr(r, "path", None) == path)
 
 
-def build_app(oauth: bool):
-    env = {"OMOS_INGEST_TOKEN": "test-token"}
+def build_app(oauth: bool, ingest_token: str = "test-token"):
+    env = {"OMOS_INGEST_TOKEN": ingest_token}
     env.update({"OAUTH_ISSUER": "https://issuer.test", "OAUTH_AUDIENCE": "https://a.test",
                 "PUBLIC_URL": "https://a.test"} if oauth else {"OMOS_AUTH_TOKEN": "mcp-token"})
     captured = {}
@@ -193,7 +193,9 @@ def build_app(oauth: bool):
     def fake_run(app, **kw):
         captured["app"] = app
 
+    # INGEST_TOKEN is read at import, so the module attribute is what the app sees
     with patch.dict(os.environ, env, clear=False), \
+         patch.object(server, "INGEST_TOKEN", ingest_token), \
          patch.object(server, "_svc", lambda: FakeSvc(FakeFiles({}))), \
          patch("uvicorn.run", fake_run), \
          patch.object(server, "_OAuthTokenVerifier", lambda *a, **k: object()):
@@ -231,5 +233,17 @@ for oauth_mode in (True, False):
                       lambda p: (_ for _ in ()).throw(drive_error(503, "backendError"))):
         resp = asyncio.run(endpoint(FakeRequest("test-token")))
     assert resp.status_code == 502 and json.loads(resp.body)["retryable"] is True
+
+# Ingestion off: the endpoint must not exist at all, so a deployment that has not
+# opted in keeps answering exactly as it did before this feature landed.
+for oauth_mode in (True, False):
+    app = build_app(oauth_mode, ingest_token="")
+    paths = [getattr(r, "path", None) for r in app.router.routes]
+    assert "/transcripts" not in paths, f"oauth={oauth_mode}: route must be absent, got {paths}"
+    assert "/healthz" in paths and "/mcp" in paths, paths
+
+# ...and the key it runs with cannot write anything either
+assert server.DRIVE_SCOPE.endswith("/drive.readonly") if not server.INGEST_TOKEN \
+    else server.DRIVE_SCOPE.endswith("/drive"), server.DRIVE_SCOPE
 
 print("ok")
