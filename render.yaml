@@ -16,6 +16,10 @@ services:
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         sync: false
       # Token the transcript ingestion caller (น้องจิก) must send to POST /transcripts.
-      # Separate from the MCP token so it can be revoked on its own.
+      # Separate from the MCP token so it can be revoked on its own. Deliberately
+      # NOT generated: setting it is what turns ingestion on (it registers
+      # /transcripts and widens the Drive scope to write), and that must be a
+      # decision someone makes in the dashboard, not a side effect of deploying.
+      # Grant the service account Content manager on the drive BEFORE setting it.
       - key: OMOS_INGEST_TOKEN
-        generateValue: true
+        sync: false

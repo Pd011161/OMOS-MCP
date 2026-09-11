@@ -143,9 +143,11 @@ curl -X POST https://<app>.onrender.com/transcripts \
 
 📘 **สเปกเต็มสำหรับทีมที่จะเรียก API นี้: [docs/API.md](docs/API.md)**
 
-> **ความปลอดภัย:** endpoint นี้เขียนไฟล์ได้ ต้องตั้ง `OMOS_INGEST_TOKEN` ถึงจะทำงาน (ไม่ตั้ง = ตอบ 401 ทุก request) และโค้ด**สร้างไฟล์ใหม่อย่างเดียว ไม่มี update/delete** เขียนได้เฉพาะในโฟลเดอร์โปรเจคที่ resolve ได้แล้วเท่านั้น
+> **ความปลอดภัย:** endpoint นี้เขียนไฟล์ได้ ต้องตั้ง `OMOS_INGEST_TOKEN` ถึงจะทำงาน (ไม่ตั้ง = ไม่มี route นี้อยู่เลย ตอบ 404 และ scope ของ service account เป็น `drive.readonly` เขียนอะไรไม่ได้) และโค้ด**สร้างไฟล์ใหม่อย่างเดียว ไม่มี update/delete** เขียนได้เฉพาะในโฟลเดอร์โปรเจคที่ resolve ได้แล้วเท่านั้น
 >
-> ⚠️ ฟีเจอร์นี้ต้องให้ service account มีสิทธิ์ **Content manager** (เขียนได้) บน Shared Drive และ scope เปลี่ยนเป็น `drive` — ถ้าใช้แค่ฝั่งอ่าน ไม่ต้องตั้ง `OMOS_INGEST_TOKEN` ก็ได้
+> ⚠️ ฟีเจอร์นี้ต้องให้ service account มีสิทธิ์ **Content manager** (เขียนได้) บน Shared Drive และ scope จะเปลี่ยนเป็น `drive` อัตโนมัติเมื่อตั้ง token — ถ้าใช้แค่ฝั่งอ่าน ไม่ต้องตั้ง `OMOS_INGEST_TOKEN` ก็ได้
+>
+> **ลำดับสำคัญ:** ให้สิทธิ์ Content manager **ก่อน** แล้วค่อยตั้ง token — ถ้าสลับกัน transcript ที่ส่งเข้ามาช่วงนั้นจะได้ `403` พร้อม `retryable: false` ผู้เรียกจะไม่ส่งซ้ำ ข้อมูลหายถาวร
 
 ## เรื่อง timeout
 
