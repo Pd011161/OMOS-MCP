@@ -94,6 +94,22 @@ _TREE = {
 listed = []
 
 
+class _FakeSvc:
+    """Just enough Drive client for _search_scope: files().get(...).execute()."""
+
+    def __init__(self, drive_id):
+        self._drive_id = drive_id
+
+    def files(self):
+        return self
+
+    def get(self, **_kw):
+        return self
+
+    def execute(self, **_kw):
+        return {"driveId": self._drive_id} if self._drive_id else {}
+
+
 def _fake_children(folder_id):
     listed.append(folder_id)
     return _TREE.get(folder_id, [])
@@ -174,6 +190,26 @@ assert "sub0" in out, "partial listing must still return what it walked"
 with patch.object(server, "_read", lambda fid: (_ for _ in ()).throw(TimeoutError("timed out"))):
     out = server._omos_read("abc123")
 assert "timed out" in out and "abc123" in out, out
+
+# .env parsing: a JSON key may span lines, but a stray brace in any other value
+# must not swallow the keys after it
+from omos_mcp.server import _parse_env
+
+assert _parse_env("A=1\nB=2\n") == {"A": "1", "B": "2"}
+assert _parse_env('K={"t":"sa"}\nB=2\n') == {"K": '{"t":"sa"}', "B": "2"}
+assert _parse_env('K={\n "t":"sa"\n}\nB=2\n') == {"K": '{"t":"sa"}', "B": "2"}, "multi-line key must join"
+for bad in ("A=ab{cd\nB=2\n", "A=ab}cd\nB=2\n"):
+    assert _parse_env(bad) == {"A": bad.split("=", 1)[1].split("\n")[0], "B": "2"}, \
+        f"a lone brace must not eat later keys: {_parse_env(bad)}"
+
+# search must be confined to the drive the root lives in, and stay unscoped on a My Drive root
+for drive_id, expected in (("0ADriveXYZ", {"corpora": "drive", "driveId": "0ADriveXYZ"}), ("", {})):
+    server._drive_id["value"] = None
+    with patch.object(server, "_svc", lambda: _FakeSvc(drive_id)):
+        assert server._search_scope() == expected, f"{drive_id!r} -> {server._search_scope()}"
+    with patch.object(server, "_svc", lambda: (_ for _ in ()).throw(AssertionError("not cached"))):
+        assert server._search_scope() == expected, "driveId must be looked up once, then cached"
+server._drive_id["value"] = None
 
 # ponytail: pdf extraction not self-checked — pypdf can't author text PDFs; covered by real-drive test
 print("ok")

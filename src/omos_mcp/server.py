@@ -4,7 +4,6 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -25,7 +24,9 @@ def _parse_env(text: str) -> dict[str, str]:
             key, buf = key.strip(), buf.strip()
         else:
             buf += line.strip()
-        if buf.count("{") == buf.count("}"):  # complete value (no braces, or balanced)
+        # Only a JSON value spans lines; anything else ends at its own line, or a
+        # stray brace in a plain value would swallow every key after it.
+        if not buf.startswith("{") or buf.count("{") == buf.count("}"):
             out[key] = buf.strip("'\"")
             key, buf = "", ""
     return out
@@ -54,7 +55,10 @@ HTTP_TIMEOUT = float(os.environ.get("OMOS_HTTP_TIMEOUT", "20"))  # seconds per D
 # cannot do the OAuth dance, and this can be revoked without touching MCP access.
 INGEST_TOKEN = os.environ.get("OMOS_INGEST_TOKEN", "")
 TRANSCRIPT_FOLDER = os.environ.get("OMOS_TRANSCRIPT_FOLDER", "Meeting Transcripts")
-MAX_TRANSCRIPT_BYTES = 10 * 1024 * 1024
+# Drive converts the upload into a Google Doc, which caps out near 1.02M characters.
+# 10 MB of Thai (3 bytes/char) is ~3.4M characters — it would pass here and fail at
+# Drive with an opaque error, so refuse it at the door instead.
+MAX_TRANSCRIPT_BYTES = 1 * 1024 * 1024
 
 FOLDER_MT = "application/vnd.google-apps.folder"
 DOC_MT = "application/vnd.google-apps.document"
@@ -148,6 +152,8 @@ def _service_account_info(raw: str) -> dict:
         ) from None
 
 
+# ponytail: num_retries=3 on every execute() — googleapiclient already does
+# exponential backoff for 429/5xx, so there is no retry logic of our own to keep.
 _FILE_FIELDS = "id,name,mimeType,webViewLink,parents"
 
 
@@ -162,7 +168,7 @@ def _list_children(folder_id: str) -> list[dict]:
             orderBy="folder,name",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
-        ).execute()
+        ).execute(num_retries=3)
         files += resp.get("files", [])
         token = resp.get("nextPageToken")
         if not token:
@@ -176,7 +182,24 @@ def _list_children(folder_id: str) -> list[dict]:
 _projects: dict = {"built_at": 0.0, "by_name": {}}  # name -> [folder ids]
 _folders: dict[str, tuple[str, str]] = {}  # folder id -> (name, parent id)
 _lock = threading.Lock()
+_drive_id: dict = {"value": None}  # None = not looked up yet, "" = plain My Drive
 _create_lock = threading.Lock()  # serialises transcript-folder creation
+
+
+def _search_scope() -> dict:
+    """Confine a search to the one drive the root lives in.
+
+    Without this a fullText search spans everything the service account can see
+    anywhere in Drive, and files from outside OMOS come back as results. A root in
+    a plain My Drive folder has no drive to name, so it keeps the unscoped query.
+    """
+    if _drive_id["value"] is None:
+        meta = _svc().files().get(
+            fileId=OMOS_ROOT_FOLDER_ID, fields="driveId", supportsAllDrives=True
+        ).execute(num_retries=3)
+        _drive_id["value"] = meta.get("driveId", "")
+    drive_id = _drive_id["value"]
+    return {"corpora": "drive", "driveId": drive_id} if drive_id else {}
 
 
 def _ensure_projects() -> None:
@@ -203,7 +226,7 @@ def _folder(folder_id: str) -> tuple[str, str]:
     if hit is None:
         meta = _svc().files().get(
             fileId=folder_id, fields="id,name,parents", supportsAllDrives=True
-        ).execute()
+        ).execute(num_retries=3)
         parents = meta.get("parents") or [""]
         hit = (meta.get("name", "?"), parents[0])
         _folders[folder_id] = hit
@@ -405,6 +428,7 @@ def _omos_search(query: str, project: str) -> str:
 
     deadline = time.monotonic() + DEADLINE
     q = query.replace("\\", "\\\\").replace("'", "\\'")
+    scope = _search_scope()
     files, token = [], None
     while True:
         resp = _svc().files().list(
@@ -414,7 +438,8 @@ def _omos_search(query: str, project: str) -> str:
             pageToken=token,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
-        ).execute()
+            **scope,
+        ).execute(num_retries=3)
         files += resp.get("files", [])
         token = resp.get("nextPageToken")
         if not token or len(files) >= 200 or time.monotonic() > deadline:
@@ -471,7 +496,7 @@ def _read(file_id: str):
     svc = _svc()
     meta = svc.files().get(
         fileId=file_id, fields="id,name,mimeType,webViewLink,size,parents", supportsAllDrives=True
-    ).execute()
+    ).execute(num_retries=3)
     mt, name = meta["mimeType"], meta["name"]
     cite = _cite(name, meta.get("parents"), meta.get("webViewLink", ""))
 
@@ -486,14 +511,14 @@ def _read(file_id: str):
     }
     if mt in exports:
         try:
-            data = svc.files().export(fileId=file_id, mimeType=exports[mt]).execute()
+            data = svc.files().export(fileId=file_id, mimeType=exports[mt]).execute(num_retries=3)
         except Exception:
-            data = svc.files().export(fileId=file_id, mimeType="text/plain").execute()
+            data = svc.files().export(fileId=file_id, mimeType="text/plain").execute(num_retries=3)
         return cite + _truncate(data.decode("utf-8", errors="replace"))
     if mt.startswith("application/vnd.google-apps"):
         return cite + f"Error: unsupported Google file type '{mt}'. Open it via the link."
 
-    data = svc.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
+    data = svc.files().get_media(fileId=file_id, supportsAllDrives=True).execute(num_retries=3)
 
     if mt.startswith("image/"):
         fmt = mt.split("/", 1)[1].split("+")[0]
@@ -631,7 +656,7 @@ def _transcript_folder(project_folder_id: str) -> str:
             body={"name": TRANSCRIPT_FOLDER, "mimeType": FOLDER_MT, "parents": [project_folder_id]},
             fields="id",
             supportsAllDrives=True,
-        ).execute()
+        ).execute(num_retries=3)
         return created["id"]
 
 
@@ -647,7 +672,7 @@ def _existing_transcript(folder_id: str, meeting_id: str, name: str) -> dict | N
     found = _svc().files().list(
         q=q, fields="files(id,name,webViewLink)", pageSize=1,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
-    ).execute().get("files", [])
+    ).execute(num_retries=3).get("files", [])
     return found[0] if found else None
 
 
@@ -712,7 +737,7 @@ def save_transcript(payload: dict) -> dict:
         media_body=MediaInMemoryUpload(body.encode("utf-8"), mimetype="text/markdown", resumable=False),
         fields="id,webViewLink",
         supportsAllDrives=True,
-    ).execute()
+    ).execute(num_retries=3)
 
     logging.getLogger("omos_mcp").info(
         "transcript filed: project=%r meeting_id=%r date=%s file=%s",

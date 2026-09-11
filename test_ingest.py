@@ -53,7 +53,7 @@ class _Exec:
     def __init__(self, value):
         self.value = value
 
-    def execute(self):
+    def execute(self, **_kw):  # num_retries is passed by the real caller
         return self.value
 
 

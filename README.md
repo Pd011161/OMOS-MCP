@@ -121,7 +121,7 @@ curl -X POST https://<app>.onrender.com/transcripts \
 |---|---|---|
 | `project` | ✅ | ต้องตรงกับชื่อโฟลเดอร์ชั้นบนสุด **เป๊ะๆ** — ไม่มี fuzzy match |
 | `title` / `date` | ✅ | ใช้ตั้งชื่อไฟล์: `2026-09-03 — Weekly sync` |
-| `transcript` | ✅ | สูงสุด 10 MB |
+| `transcript` | ✅ | สูงสุด 1 MB (~350,000 ตัวอักษรไทย) |
 | `meeting_id` | ➖ | **ควรส่ง** — ใช้กันไฟล์ซ้ำตอน retry |
 | `translation` | ➖ | ต่อท้ายเป็นอีก section ในไฟล์เดียวกัน |
 
